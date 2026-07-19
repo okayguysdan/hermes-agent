@@ -6708,6 +6708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
+            _rewrite_texts = []
             for _result in _hook_results:
                 if not isinstance(_result, dict):
                     continue
@@ -6723,11 +6724,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+                        _rewrite_texts.append(_new_text)
+
+            _distinct_rewrites = list(dict.fromkeys(_rewrite_texts))
+            if len(_distinct_rewrites) > 1:
+                logger.warning(
+                    "pre_gateway_dispatch conflicting rewrites; dropping message: "
+                    "platform=%s chat=%s rewrite_count=%d",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                    len(_distinct_rewrites),
+                )
+                return None
+            if _distinct_rewrites:
+                event = dataclasses.replace(event, text=_distinct_rewrites[0])
+                source = event.source
 
         if is_internal:
             pass

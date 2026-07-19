@@ -15,6 +15,11 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 def _clear_auth_env(monkeypatch) -> None:
     for key in (
         "TELEGRAM_ALLOWED_USERS",
@@ -60,7 +65,7 @@ def _make_runner(platform: Platform):
     return runner, adapter
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_hook_skip_short_circuits_dispatch(monkeypatch):
     """A plugin returning {'action': 'skip'} drops the message before auth."""
     _clear_auth_env(monkeypatch)
@@ -81,7 +86,7 @@ async def test_hook_skip_short_circuits_dispatch(monkeypatch):
     runner.pairing_store.generate_code.assert_not_called()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_hook_rewrite_replaces_event_text(monkeypatch):
     """A plugin returning {'action': 'rewrite', 'text': ...} mutates event.text."""
     _clear_auth_env(monkeypatch)
@@ -108,7 +113,7 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
     assert seen_text.get("value") == "REWRITTEN"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
     _clear_auth_env(monkeypatch)
@@ -132,7 +137,86 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
     runner.pairing_store.generate_code.assert_called_once()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_hook_allow_cannot_bypass_later_skip(monkeypatch):
+    """An early allow is only a no-op; a later skip still wins."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "allow"},
+                {"action": "skip", "reason": "later-policy-denial"},
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    result = await runner._handle_message(_make_event("hi"))
+
+    assert result is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_hook_allow_cannot_bypass_later_rewrite(monkeypatch):
+    """An early allow does not suppress a later rewrite."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    seen_text = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "allow"},
+                {"action": "rewrite", "text": "REWRITTEN"},
+            ]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen_text.get("value") == "REWRITTEN"
+
+
+@pytest.mark.anyio
+async def test_hook_conflicting_rewrites_fail_closed(monkeypatch):
+    """Two plugins cannot ambiguously redirect the same message."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "rewrite", "text": "FIRST"},
+                {"action": "rewrite", "text": "SECOND"},
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(return_value="should-not-run")
+
+    result = await runner._handle_message(_make_event("original"))
+
+    assert result is None
+    adapter.send.assert_not_awaited()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_hook_exception_does_not_break_dispatch(monkeypatch):
     """A raising plugin hook does not break the gateway."""
     _clear_auth_env(monkeypatch)
@@ -151,7 +235,7 @@ async def test_hook_exception_does_not_break_dispatch(monkeypatch):
     assert result is None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_internal_events_bypass_hook(monkeypatch):
     """Internal events (event.internal=True) skip the plugin hook entirely."""
     _clear_auth_env(monkeypatch)
