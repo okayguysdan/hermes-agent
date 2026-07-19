@@ -242,7 +242,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
+    atomic_json_write(path, payload, indent=None, separators=(",", ":"), mode=0o600)
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:

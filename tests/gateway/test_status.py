@@ -263,9 +263,16 @@ class TestGatewayRuntimeStatus:
             (
                 target,
                 payload,
-                {"indent": None, "separators": (",", ":")},
+                {"indent": None, "separators": (",", ":"), "mode": 0o600},
             )
         ]
+
+    def test_runtime_status_is_owner_only_for_peer_pid_trust(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(gateway_state="running")
+
+        assert (tmp_path / "gateway_state.json").stat().st_mode & 0o777 == 0o600
 
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
         """Regression: setdefault() preserved stale PID from previous process (#1631)."""
