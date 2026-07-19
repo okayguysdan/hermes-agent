@@ -21,7 +21,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_constants import (
+    display_hermes_home,
+    get_default_hermes_root,
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +336,36 @@ def _detect_prefix(zf: zipfile.ZipFile) -> str:
     return ""
 
 
+def _config_home_for_restore(target: Path, hermes_root: Path) -> Optional[Path]:
+    """Return the config scope for a canonical root or profile config path."""
+    try:
+        resolved_root = hermes_root.resolve()
+        resolved_target = target.resolve()
+        rel = resolved_target.relative_to(resolved_root)
+    except ValueError:
+        return None
+    if rel.parts == ("config.yaml",):
+        return resolved_root
+    if (
+        len(rel.parts) == 3
+        and rel.parts[0] == "profiles"
+        and rel.parts[2] == "config.yaml"
+    ):
+        return resolved_target.parent
+    return None
+
+
+def _restore_config_bytes(config_home: Path, raw: bytes) -> None:
+    """Atomically replace one scoped config through the shared writer lock."""
+    from hermes_cli.config import save_config_bytes_replacement
+
+    token = set_hermes_home_override(config_home)
+    try:
+        save_config_bytes_replacement(raw)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def run_import(args) -> None:
     """Restore a Hermes backup from a zip file."""
     zip_path = Path(args.zipfile).expanduser().resolve()
@@ -408,8 +444,13 @@ def run_import(args) -> None:
 
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    dst.write(src.read())
+                config_home = _config_home_for_restore(target, hermes_root)
+                if config_home is not None:
+                    with zf.open(member) as src:
+                        _restore_config_bytes(config_home, src.read())
+                else:
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
                 if target.name in _SECRET_FILE_NAMES:
                     os.chmod(target, 0o600)
                 restored += 1
@@ -648,7 +689,7 @@ def restore_quick_snapshot(
     Overwrites current state files with the snapshot's copies.
     Returns True if at least one file was restored.
     """
-    home = hermes_home or get_hermes_home()
+    home = Path(hermes_home or get_hermes_home())
     root = _quick_snapshot_root(home)
     snap_dir = root / snapshot_id
 
@@ -672,7 +713,10 @@ def restore_quick_snapshot(
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            if dst.suffix == ".db":
+            config_home = _config_home_for_restore(dst, home)
+            if config_home is not None:
+                _restore_config_bytes(config_home, src.read_bytes())
+            elif dst.suffix == ".db":
                 # Atomic-ish replace for databases
                 tmp = dst.parent / f".{dst.name}.snap_restore"
                 shutil.copy2(src, tmp)

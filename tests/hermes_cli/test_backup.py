@@ -1,6 +1,7 @@
 """Tests for hermes backup and import commands."""
 
 import json
+import multiprocessing
 import os
 import sqlite3
 import zipfile
@@ -73,6 +74,49 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target)
     except OSError as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+
+def _locked_config_writer(home_str, locked, release, result) -> None:
+    """Hold the real cross-process config lock until the test releases it."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import config_write_lock, load_config, save_config
+
+    token = set_hermes_home_override(home_str)
+    try:
+        with config_write_lock():
+            config = load_config()
+            config["concurrent_writer"] = True
+            locked.set()
+            if not release.wait(10):
+                result.put("release-timeout")
+                return
+            save_config(config)
+        result.put("saved")
+    except BaseException as exc:
+        result.put(f"{type(exc).__name__}: {exc}")
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _archive_import_worker(home_str, zip_str, locked, attempted, done) -> None:
+    from hermes_cli.backup import run_import
+
+    os.environ["HERMES_HOME"] = home_str
+    if not locked.wait(10):
+        return
+    attempted.set()
+    run_import(Namespace(zipfile=zip_str, force=True))
+    done.set()
+
+
+def _quick_restore_worker(home_str, snapshot_id, locked, attempted, done) -> None:
+    from hermes_cli.backup import restore_quick_snapshot
+
+    if not locked.wait(10):
+        return
+    attempted.set()
+    restore_quick_snapshot(snapshot_id, hermes_home=Path(home_str))
+    done.set()
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +667,116 @@ class TestImport:
         for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
+
+
+class TestConfigRestoreContention:
+    def test_normalized_archive_paths_still_identify_scoped_configs(self, tmp_path):
+        from hermes_cli.backup import _config_home_for_restore
+
+        home = tmp_path / ".hermes"
+        assert _config_home_for_restore(home / "nested" / ".." / "config.yaml", home) == home
+        assert _config_home_for_restore(
+            home / "profiles" / "coder" / "nested" / ".." / "config.yaml", home,
+        ) == home / "profiles" / "coder"
+
+    @pytest.mark.parametrize("config_rel", ["config.yaml", "profiles/coder/config.yaml"])
+    def test_archive_import_waits_for_scoped_config_writer(self, tmp_path, config_rel):
+        """Root and profile imports must not bypass a compliant writer's lock."""
+        home = tmp_path / ".hermes"
+        config_path = home / config_rel
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("initial: true\n")
+        archive = tmp_path / "backup.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(".env", "MARKER=1\n")
+            zf.writestr(config_rel, "restored: archive\n")
+
+        ctx = multiprocessing.get_context("spawn")
+        locked, release = ctx.Event(), ctx.Event()
+        attempted, done = ctx.Event(), ctx.Event()
+        result = ctx.Queue()
+        writer = ctx.Process(
+            target=_locked_config_writer,
+            args=(str(config_path.parent), locked, release, result),
+        )
+        restore = ctx.Process(
+            target=_archive_import_worker,
+            args=(str(home), str(archive), locked, attempted, done),
+        )
+        writer.start()
+        restore.start()
+        try:
+            assert attempted.wait(10), "archive import never started"
+            assert not done.wait(1), "archive import bypassed the config writer lock"
+            assert config_path.read_text() == "initial: true\n"
+            release.set()
+            writer.join(10)
+            restore.join(10)
+            assert writer.exitcode == 0
+            assert restore.exitcode == 0
+            assert result.get(timeout=2) == "saved"
+            assert config_path.read_text() == "restored: archive\n"
+        finally:
+            release.set()
+            writer.join(2)
+            restore.join(2)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(2)
+            if restore.is_alive():
+                restore.terminate()
+                restore.join(2)
+
+    def test_quick_restore_waits_for_config_writer(self, tmp_path):
+        """Quick restore must serialize its config replacement with writers."""
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        config_path.write_text("initial: true\n")
+        snapshot_id = "snapshot-under-test"
+        snapshot = home / "state-snapshots" / snapshot_id
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.yaml").write_text("restored: snapshot\n")
+        (snapshot / "manifest.json").write_text(json.dumps({
+            "id": snapshot_id,
+            "files": {"config.yaml": 19},
+        }))
+
+        ctx = multiprocessing.get_context("spawn")
+        locked, release = ctx.Event(), ctx.Event()
+        attempted, done = ctx.Event(), ctx.Event()
+        result = ctx.Queue()
+        writer = ctx.Process(
+            target=_locked_config_writer,
+            args=(str(home), locked, release, result),
+        )
+        restore = ctx.Process(
+            target=_quick_restore_worker,
+            args=(str(home), snapshot_id, locked, attempted, done),
+        )
+        writer.start()
+        restore.start()
+        try:
+            assert attempted.wait(10), "quick restore never started"
+            assert not done.wait(1), "quick restore bypassed the config writer lock"
+            assert config_path.read_text() == "initial: true\n"
+            release.set()
+            writer.join(10)
+            restore.join(10)
+            assert writer.exitcode == 0
+            assert restore.exitcode == 0
+            assert result.get(timeout=2) == "saved"
+            assert config_path.read_text() == "restored: snapshot\n"
+        finally:
+            release.set()
+            writer.join(2)
+            restore.join(2)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(2)
+            if restore.is_alive():
+                restore.terminate()
+                restore.join(2)
 
 
 # ---------------------------------------------------------------------------
