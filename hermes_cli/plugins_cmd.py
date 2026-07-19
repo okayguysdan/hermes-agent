@@ -771,7 +771,12 @@ def _resolve_plugin_key(name: str) -> Optional[str]:
     return None
 
 
-def cmd_enable(name: str, *, print_config_digest: bool = False) -> None:
+def cmd_enable(
+    name: str,
+    *,
+    print_config_digest: bool = False,
+    transaction_backup=None,
+) -> None:
     """Add a plugin to the enabled allow-list (and remove it from disabled)."""
     from rich.console import Console
 
@@ -783,12 +788,31 @@ def cmd_enable(name: str, *, print_config_digest: bool = False) -> None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
 
-    from hermes_cli.config import config_snapshot_digest, config_write_lock
+    from hermes_cli.config import (
+        capture_config_baseline,
+        config_snapshot_digest,
+        config_write_lock,
+        load_config,
+        save_config,
+    )
 
     already_enabled = False
+    baseline_present = None
     with config_write_lock():
-        enabled = _get_enabled_set()
-        disabled = _get_disabled_set()
+        if transaction_backup is not None:
+            baseline_present = capture_config_baseline(transaction_backup)
+            config = load_config()
+            plugins_cfg = config.get("plugins")
+            if not isinstance(plugins_cfg, dict):
+                plugins_cfg = {}
+                config["plugins"] = plugins_cfg
+            raw_enabled = plugins_cfg.get("enabled", [])
+            raw_disabled = plugins_cfg.get("disabled", [])
+            enabled = set(raw_enabled) if isinstance(raw_enabled, list) else set()
+            disabled = set(raw_disabled) if isinstance(raw_disabled, list) else set()
+        else:
+            enabled = _get_enabled_set()
+            disabled = _get_disabled_set()
 
         if key in enabled and key not in disabled:
             already_enabled = True
@@ -799,9 +823,14 @@ def cmd_enable(name: str, *, print_config_digest: bool = False) -> None:
             bare = key.split("/")[-1]
             if bare != key:
                 disabled.discard(bare)
-            _save_enabled_set(enabled)
-            _save_disabled_set(disabled)
-        digest = config_snapshot_digest() if print_config_digest else None
+            if transaction_backup is not None:
+                plugins_cfg["enabled"] = sorted(enabled)
+                plugins_cfg["disabled"] = sorted(disabled)
+                save_config(config)
+            else:
+                _save_enabled_set(enabled)
+                _save_disabled_set(disabled)
+        digest = config_snapshot_digest() if (print_config_digest or transaction_backup is not None) else None
     if already_enabled:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
     else:
@@ -810,6 +839,8 @@ def cmd_enable(name: str, *, print_config_digest: bool = False) -> None:
             "Takes effect on next session."
         )
     if digest is not None:
+        if baseline_present is not None:
+            console.print(f"config-baseline:{'present' if baseline_present else 'absent'}")
         console.print(f"config-sha256:{digest}")
 
 
@@ -1838,6 +1869,7 @@ def plugins_command(args) -> None:
         cmd_enable(
             args.name,
             print_config_digest=getattr(args, "print_config_digest", False),
+            transaction_backup=getattr(args, "config_transaction_backup", None),
         )
     elif action == "disable":
         cmd_disable(args.name)

@@ -91,6 +91,10 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         action="store_true",
         help="Print a transaction-bound config digest for rollback CAS",
     )
+    plugins_enable.add_argument(
+        "--config-transaction-backup",
+        help="Atomically capture the config baseline before enabling and print a rollback receipt",
+    )
 
     plugins_disable = plugins_subparsers.add_parser(
         "disable", help="Disable a plugin without removing it"

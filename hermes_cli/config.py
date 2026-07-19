@@ -329,6 +329,36 @@ def config_snapshot_digest(path: Optional[Path] = None) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def capture_config_baseline(backup_path: Path) -> bool:
+    """Capture config bytes to a new private file while the caller holds the lock."""
+    backup = Path(backup_path)
+    if not backup.is_absolute():
+        raise ValueError("config transaction backup path must be absolute")
+    backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_path = get_config_path()
+    if not config_path.exists():
+        if backup.exists() or backup.is_symlink():
+            raise FileExistsError(backup)
+        return False
+    raw = config_path.read_bytes()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(backup, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        try:
+            backup.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return True
+
+
 def compare_restore_config(
     expected_digest: str,
     backup_path: Optional[Path] = None,
@@ -5822,6 +5852,38 @@ def save_config_replacement(config: Dict[str, Any]):
     _save_config(config, replacement=True)
 
 
+def save_config_bytes_replacement(raw: bytes) -> None:
+    """Explicitly replace config.yaml with already-rendered bytes under the lock."""
+    if not isinstance(raw, bytes):
+        raise TypeError("raw config replacement must be bytes")
+    with config_write_lock():
+        if is_managed():
+            managed_error("save configuration")
+            return
+        ensure_hermes_home()
+        config_path = get_config_path()
+        fd, temporary = tempfile.mkstemp(
+            dir=str(config_path.parent), prefix=".config-replacement-", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb", closefd=True) as output:
+                output.write(raw)
+                output.flush()
+                os.fsync(output.fileno())
+            atomic_replace(temporary, config_path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+        _secure_file(config_path)
+        path_key = str(config_path)
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
+
+
 def load_env() -> Dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
 
@@ -6506,13 +6568,6 @@ def set_config_value(key: str, value: str):
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
     config_path = get_config_path()
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
-        except Exception:
-            user_config = {}
     
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
@@ -6529,12 +6584,12 @@ def set_config_value(key: str, value: str):
     elif value.replace('.', '', 1).isdigit():
         value = float(value)
 
-    _set_nested(user_config, key, value)
-    
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    # Read and write one raw-config transaction under the shared lock so this
+    # command cannot race another compliant writer between those operations.
+    with config_write_lock():
+        user_config = read_raw_config()
+        _set_nested(user_config, key, value)
+        save_config(user_config)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.

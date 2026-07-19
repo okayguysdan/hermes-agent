@@ -192,3 +192,46 @@ class TestEnableDisableNested:
         cmd_enable("disk-cleanup")
         saved = mock_save_en.call_args[0][0]
         assert "disk-cleanup" in saved
+
+
+def test_enable_transaction_captures_baseline_and_receipt(
+    tmp_path, monkeypatch, capsys,
+):
+    import yaml
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("unrelated: preserved\n", encoding="utf-8")
+    backup_path = tmp_path / "transaction" / "config.baseline"
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._resolve_plugin_key",
+        lambda _name: "out-of-office-approval",
+    )
+    from hermes_cli.plugins_cmd import cmd_enable
+
+    cmd_enable("out-of-office-approval", transaction_backup=backup_path)
+
+    assert backup_path.read_text(encoding="utf-8") == "unrelated: preserved\n"
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["unrelated"] == "preserved"
+    assert "out-of-office-approval" in persisted["plugins"]["enabled"]
+    output = capsys.readouterr().out
+    assert "config-baseline:present" in output
+    assert "config-sha256:" in output
+
+
+def test_enable_transaction_receipts_an_absent_baseline(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    backup_path = tmp_path / "transaction" / "config.baseline"
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._resolve_plugin_key",
+        lambda _name: "out-of-office-approval",
+    )
+    from hermes_cli.plugins_cmd import cmd_enable
+
+    cmd_enable("out-of-office-approval", transaction_backup=backup_path)
+
+    assert not backup_path.exists()
+    assert (tmp_path / "config.yaml").is_file()
+    assert "config-baseline:absent" in capsys.readouterr().out

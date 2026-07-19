@@ -173,6 +173,17 @@ def apply_migration(
     issues: List[RetirementIssue],
     backup: bool = True,
 ) -> ApplyResult:
+    """Apply one xAI migration while holding the shared config write lock."""
+    from hermes_cli.config import config_write_lock
+    with config_write_lock():
+        return _apply_migration_locked(config_path, issues, backup)
+
+
+def _apply_migration_locked(
+    config_path: Path,
+    issues: List[RetirementIssue],
+    backup: bool = True,
+) -> ApplyResult:
     """Rewrite ``config_path`` in-place so each issue is resolved.
 
     For every issue, the model name is replaced by ``issue.replacement``. If the
@@ -242,8 +253,24 @@ def apply_migration(
         )
         shutil.copy2(config_path, backup_path)
 
-    with config_path.open("w", encoding="utf-8") as fh:
-        yaml.dump(doc, fh)
+    import os
+    import tempfile
+    from utils import atomic_replace
+    fd, temporary = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=".config-xai-", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            yaml.dump(doc, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(temporary, config_path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
     return ApplyResult(
         file_path=config_path,
