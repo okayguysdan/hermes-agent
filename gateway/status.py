@@ -515,20 +515,27 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    home_target_ready: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
+    now = _utc_now_iso()
     payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
-    payload["updated_at"] = _utc_now_iso()
+    payload["updated_at"] = now
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
+        if gateway_state == "starting":
+            # Runtime platform state belongs to this process. Do not retain
+            # entries from a prior gateway whose configuration may have been
+            # removed or changed between starts.
+            payload["platforms"] = {}
     if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
     if restart_requested is not _UNSET:
@@ -544,7 +551,22 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
-        platform_payload["updated_at"] = _utc_now_iso()
+        platform_payload["updated_at"] = now
+        if platform == "bluebubbles":
+            # This status file is intentionally safe for remote health
+            # consumers. Persist capability only, never the configured chat,
+            # contact name, or thread. Direct adapter writes do not own the
+            # gateway config, so they fail closed unless the runner explicitly
+            # confirms both connection and a configured home target.
+            for sensitive_key in ("chat_id", "name", "thread_id"):
+                platform_payload.pop(sensitive_key, None)
+            effective_state = platform_payload.get("state")
+            platform_payload["home_target_ready"] = bool(
+                effective_state == "connected"
+                and home_target_ready is not _UNSET
+                and home_target_ready
+            )
+            platform_payload["home_target_checked_at"] = now
         payload["platforms"][platform] = platform_payload
 
     _write_json_file(path, payload)

@@ -358,6 +358,74 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_bluebubbles_status_persists_only_redacted_home_readiness(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sentinel = "SENTINEL_PRIVATE_HOME_TARGET"
+        (tmp_path / "gateway_state.json").write_text(json.dumps({
+            "platforms": {
+                "bluebubbles": {
+                    "chat_id": sentinel,
+                    "name": "SENTINEL_PRIVATE_HOME_NAME",
+                    "thread_id": "SENTINEL_PRIVATE_THREAD",
+                },
+            },
+        }))
+
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="connected",
+            home_target_ready=True,
+        )
+
+        raw = (tmp_path / "gateway_state.json").read_text()
+        payload = json.loads(raw)
+        bluebubbles = payload["platforms"]["bluebubbles"]
+        assert bluebubbles["home_target_ready"] is True
+        assert bluebubbles["home_target_checked_at"].endswith("+00:00")
+        assert sentinel not in raw
+        assert not ({"chat_id", "name", "thread_id"} & bluebubbles.keys())
+
+    def test_bluebubbles_disconnect_forces_home_not_ready_with_fresh_timestamp(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        timestamps = iter((
+            "2026-07-19T10:00:00+00:00",
+            "2026-07-19T10:01:00+00:00",
+            "2026-07-19T10:02:00+00:00",
+            "2026-07-19T10:03:00+00:00",
+        ))
+        monkeypatch.setattr(status, "_utc_now_iso", lambda: next(timestamps))
+
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="connected",
+            home_target_ready=True,
+        )
+        ready = status.read_runtime_status()["platforms"]["bluebubbles"]
+
+        # Simulate the adapter's direct runtime-status write. It has no access
+        # to GatewayConfig, so the writer itself must fail closed.
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="disconnected",
+        )
+        disconnected = status.read_runtime_status()["platforms"]["bluebubbles"]
+
+        assert ready["home_target_ready"] is True
+        assert disconnected["home_target_ready"] is False
+        assert disconnected["home_target_checked_at"] != ready["home_target_checked_at"]
+
+    def test_gateway_startup_clears_stale_platform_status(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="connected",
+            home_target_ready=True,
+        )
+
+        status.write_runtime_status(gateway_state="starting", exit_reason=None)
+
+        assert status.read_runtime_status()["platforms"] == {}
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

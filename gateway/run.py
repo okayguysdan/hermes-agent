@@ -3318,12 +3318,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(
+            status_fields = dict(
                 platform=platform,
                 platform_state=platform_state,
                 error_code=error_code,
                 error_message=error_message,
             )
+            if platform == Platform.BLUEBUBBLES.value:
+                home = self.config.get_home_channel(Platform.BLUEBUBBLES)
+                chat_id = getattr(home, "chat_id", "") if home is not None else ""
+                status_fields["home_target_ready"] = bool(
+                    platform_state == "connected" and str(chat_id).strip()
+                )
+            write_runtime_status(**status_fields)
         except Exception:
             pass
 
