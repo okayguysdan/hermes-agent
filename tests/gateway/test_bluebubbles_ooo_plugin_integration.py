@@ -48,12 +48,25 @@ def _load_office_plugin():
         DEFAULT_PLUGINS[0],
     )
     if not path.is_file():
-        pytest.skip("Office Out of Office plugin checkout is not available")
+        pytest.fail(
+            "Office Out of Office plugin fixture is required; set "
+            "HERMES_OOO_APPROVAL_PLUGIN_TEST_PATH to its explicit checkout path"
+        )
     spec = importlib.util.spec_from_file_location("ooo_plugin_integration", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_missing_office_plugin_fixture_fails_instead_of_silently_skipping(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv(
+        "HERMES_OOO_APPROVAL_PLUGIN_TEST_PATH", str(tmp_path / "missing.py")
+    )
+    with pytest.raises(pytest.fail.Exception, match="plugin fixture is required"):
+        _load_office_plugin()
 
 
 def _adapter():

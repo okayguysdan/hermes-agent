@@ -706,12 +706,13 @@ def _get_disabled_set() -> set:
 
 def _save_disabled_set(disabled: set) -> None:
     """Write the disabled plugins list to config.yaml."""
-    from hermes_cli.config import load_config, save_config
-    config = load_config()
-    if "plugins" not in config:
-        config["plugins"] = {}
-    config["plugins"]["disabled"] = sorted(disabled)
-    save_config(config)
+    from hermes_cli.config import config_write_lock, load_config, save_config
+    with config_write_lock():
+        config = load_config()
+        if "plugins" not in config:
+            config["plugins"] = {}
+        config["plugins"]["disabled"] = sorted(disabled)
+        save_config(config)
 
 
 def _get_enabled_set() -> set:
@@ -734,12 +735,13 @@ def _get_enabled_set() -> set:
 
 def _save_enabled_set(enabled: set) -> None:
     """Write the enabled plugins list to config.yaml."""
-    from hermes_cli.config import load_config, save_config
-    config = load_config()
-    if "plugins" not in config:
-        config["plugins"] = {}
-    config["plugins"]["enabled"] = sorted(enabled)
-    save_config(config)
+    from hermes_cli.config import config_write_lock, load_config, save_config
+    with config_write_lock():
+        config = load_config()
+        if "plugins" not in config:
+            config["plugins"] = {}
+        config["plugins"]["enabled"] = sorted(enabled)
+        save_config(config)
 
 
 def _resolve_plugin_key(name: str) -> Optional[str]:
@@ -769,7 +771,7 @@ def _resolve_plugin_key(name: str) -> Optional[str]:
     return None
 
 
-def cmd_enable(name: str) -> None:
+def cmd_enable(name: str, *, print_config_digest: bool = False) -> None:
     """Add a plugin to the enabled allow-list (and remove it from disabled)."""
     from rich.console import Console
 
@@ -781,25 +783,34 @@ def cmd_enable(name: str) -> None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
 
-    enabled = _get_enabled_set()
-    disabled = _get_disabled_set()
+    from hermes_cli.config import config_snapshot_digest, config_write_lock
 
-    if key in enabled and key not in disabled:
+    already_enabled = False
+    with config_write_lock():
+        enabled = _get_enabled_set()
+        disabled = _get_disabled_set()
+
+        if key in enabled and key not in disabled:
+            already_enabled = True
+        else:
+            enabled.add(key)
+            disabled.discard(key)
+            # Drop any legacy bare-name entry so the two don't drift out of sync.
+            bare = key.split("/")[-1]
+            if bare != key:
+                disabled.discard(bare)
+            _save_enabled_set(enabled)
+            _save_disabled_set(disabled)
+        digest = config_snapshot_digest() if print_config_digest else None
+    if already_enabled:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
-        return
-
-    enabled.add(key)
-    disabled.discard(key)
-    # Drop any legacy bare-name entry so the two don't drift out of sync.
-    bare = key.split("/")[-1]
-    if bare != key:
-        disabled.discard(bare)
-    _save_enabled_set(enabled)
-    _save_disabled_set(disabled)
-    console.print(
-        f"[green]✓[/green] Plugin [bold]{key}[/bold] enabled. "
-        "Takes effect on next session."
-    )
+    else:
+        console.print(
+            f"[green]✓[/green] Plugin [bold]{key}[/bold] enabled. "
+            "Takes effect on next session."
+        )
+    if digest is not None:
+        console.print(f"config-sha256:{digest}")
 
 
 def cmd_disable(name: str) -> None:
@@ -812,22 +823,25 @@ def cmd_disable(name: str) -> None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
 
-    enabled = _get_enabled_set()
-    disabled = _get_disabled_set()
+    from hermes_cli.config import config_write_lock
 
-    if key not in enabled and key in disabled:
-        console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
-        return
+    with config_write_lock():
+        enabled = _get_enabled_set()
+        disabled = _get_disabled_set()
 
-    enabled.discard(key)
-    # Drop any legacy bare-name entry from the allow-list too, so a stale
-    # bare name can't keep a nested plugin loading after an explicit disable.
-    bare = key.split("/")[-1]
-    if bare != key:
-        enabled.discard(bare)
-    disabled.add(key)
-    _save_enabled_set(enabled)
-    _save_disabled_set(disabled)
+        if key not in enabled and key in disabled:
+            console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
+            return
+
+        enabled.discard(key)
+        # Drop any legacy bare-name entry from the allow-list too, so a stale
+        # bare name can't keep a nested plugin loading after an explicit disable.
+        bare = key.split("/")[-1]
+        if bare != key:
+            enabled.discard(bare)
+        disabled.add(key)
+        _save_enabled_set(enabled)
+        _save_disabled_set(disabled)
     console.print(
         f"[yellow]\u2298[/yellow] Plugin [bold]{key}[/bold] disabled. "
         "Takes effect on next session."
@@ -1821,7 +1835,10 @@ def plugins_command(args) -> None:
     elif action in {"remove", "rm", "uninstall"}:
         cmd_remove(args.name)
     elif action == "enable":
-        cmd_enable(args.name)
+        cmd_enable(
+            args.name,
+            print_config_digest=getattr(args, "print_config_digest", False),
+        )
     elif action == "disable":
         cmd_disable(args.name)
     elif action in {"list", "ls"}:

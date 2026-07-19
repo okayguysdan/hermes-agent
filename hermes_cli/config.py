@@ -12,7 +12,9 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import contextlib
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -236,6 +238,71 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_WRITE_LOCK_STATE = threading.local()
+
+
+def config_snapshot_digest(path: Optional[Path] = None) -> str:
+    """Return the installer-compatible digest of one regular config file."""
+    target = path or get_config_path()
+    metadata = target.stat()
+    record = {
+        "mode": metadata.st_mode,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "type": "file",
+        "value": hashlib.sha256(target.read_bytes()).hexdigest(),
+    }
+    serialized = json.dumps(record, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+@contextlib.contextmanager
+def config_write_lock():
+    """Serialize config.yaml read-modify-write transactions across processes.
+
+    The lock is reentrant within a thread so higher-level transactions can
+    call ``save_config()`` without deadlocking on a second file descriptor.
+    """
+    with _CONFIG_LOCK:
+        depth = getattr(_CONFIG_WRITE_LOCK_STATE, "depth", 0)
+        if depth:
+            _CONFIG_WRITE_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _CONFIG_WRITE_LOCK_STATE.depth -= 1
+            return
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = config_path.with_name(f"{config_path.name}.lock")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            if _IS_WINDOWS:
+                import msvcrt
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            _CONFIG_WRITE_LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _CONFIG_WRITE_LOCK_STATE.depth = 0
+                if _IS_WINDOWS:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -5528,7 +5595,7 @@ _COMMENTED_SECTIONS = """
 
 def save_config(config: Dict[str, Any]):
     """Save configuration to ~/.hermes/config.yaml."""
-    with _CONFIG_LOCK:
+    with config_write_lock():
         if is_managed():
             managed_error("save configuration")
             return

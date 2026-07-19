@@ -86,6 +86,11 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "enable", help="Enable a disabled plugin"
     )
     plugins_enable.add_argument("name", help="Plugin name to enable")
+    plugins_enable.add_argument(
+        "--print-config-digest",
+        action="store_true",
+        help="Print a transaction-bound config digest for rollback CAS",
+    )
 
     plugins_disable = plugins_subparsers.add_parser(
         "disable", help="Disable a plugin without removing it"
