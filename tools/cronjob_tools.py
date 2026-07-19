@@ -482,6 +482,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    disabled: bool = False,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -548,6 +549,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                enabled=not bool(disabled),
             )
             return json.dumps(
                 {

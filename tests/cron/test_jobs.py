@@ -198,6 +198,16 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_disabled_is_persisted_paused_without_enabled_window(self, tmp_cron_dir):
+        job = create_job(prompt="Research only", schedule="every 1h", enabled=False)
+
+        assert job["enabled"] is False
+        assert job["state"] == "paused"
+        assert job["paused_at"] is not None
+        assert job["paused_reason"] == "created-disabled"
+        assert list_jobs() == []
+        assert list_jobs(include_disabled=True)[0]["id"] == job["id"]
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")
