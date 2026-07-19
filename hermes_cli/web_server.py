@@ -3513,7 +3513,8 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
-            save_config(_denormalize_config_from_web(body.config))
+            from hermes_cli.config import save_config_replacement
+            save_config_replacement(_denormalize_config_from_web(body.config))
         return {"ok": True}
     except HTTPException:
         raise
@@ -9672,7 +9673,8 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
         with _profile_scope(body.profile or profile):
-            save_config(parsed)
+            from hermes_cli.config import save_config_replacement
+            save_config_replacement(parsed)
         return {"ok": True}
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")

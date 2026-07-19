@@ -70,23 +70,21 @@ class TestSaveModelChoiceAlwaysDict:
 
 
 class TestProviderPersistsAfterModelSave:
-    def test_update_config_for_provider_uses_atomic_yaml_write(self, config_home):
-        """Provider switches should delegate config writes to atomic_yaml_write."""
+    def test_update_config_for_provider_uses_versioned_save(self, config_home):
+        """Provider switches should use the shared versioned config save."""
         from hermes_cli.auth import _update_config_for_provider
 
         config_path = config_home / "config.yaml"
         original_text = config_path.read_text(encoding="utf-8")
 
-        def _boom(path, data, **kwargs):
-            assert path == config_path
+        def _boom(data):
             assert data["model"]["provider"] == "nous"
             assert data["model"]["base_url"] == "https://inference.example.com/v1"
             assert data["model"]["default"] == "some-old-model"
-            assert kwargs["sort_keys"] is False
-            raise OSError("simulated atomic write failure")
+            raise OSError("simulated versioned write failure")
 
-        with patch("hermes_cli.auth.atomic_yaml_write", side_effect=_boom) as mock_write:
-            with pytest.raises(OSError, match="simulated atomic write failure"):
+        with patch("hermes_cli.auth.save_config", side_effect=_boom) as mock_write:
+            with pytest.raises(OSError, match="simulated versioned write failure"):
                 _update_config_for_provider(
                     "nous",
                     "https://inference.example.com/v1/",
@@ -389,4 +387,3 @@ class TestBaseUrlValidation:
 
         saved = get_env_value("GLM_BASE_URL") or ""
         assert saved == "", "Empty input should not save a base URL"
-

@@ -18,6 +18,7 @@ from hermes_cli.config import (
     migrate_config,
     remove_env_value,
     save_config,
+    save_config_replacement,
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
@@ -240,7 +241,7 @@ class TestSaveAndLoadRoundtrip:
 
     def test_save_config_normalizes_legacy_root_level_max_turns(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            save_config({"model": "test/custom-model", "max_turns": 37})
+            save_config_replacement({"model": "test/custom-model", "max_turns": 37})
 
             saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert saved["agent"]["max_turns"] == 37

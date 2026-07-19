@@ -1281,8 +1281,9 @@ def test_discord_toolsets_user_enabled_are_honored():
 def test_save_platform_tools_strips_restricted_toolsets():
     """Hand-edited or all-platforms checklist with `discord` selected for
     Telegram must be stripped at save time."""
+    from hermes_cli.config import load_config
     from hermes_cli.tools_config import _save_platform_tools
-    config = {}
+    config = load_config()
     _save_platform_tools(config, "telegram", {"web", "terminal", "discord", "discord_admin"})
     saved = config["platform_toolsets"]["telegram"]
     assert "discord" not in saved
@@ -1550,5 +1551,3 @@ def test_real_configurable_changes_still_reported_in_diff():
     # User adds 'vision' (configurable) — must still report as added.
     new_enabled2 = (current - {"kanban"}) | {"vision"}
     assert ((new_enabled2 - current) & universe) == {"vision"}
-
-

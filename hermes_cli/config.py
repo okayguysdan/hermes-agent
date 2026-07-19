@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
+import yaml
+
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
@@ -241,6 +243,77 @@ _CONFIG_LOCK = threading.RLock()
 _CONFIG_WRITE_LOCK_STATE = threading.local()
 
 
+class ConfigConflictError(RuntimeError):
+    """A loaded config no longer matches the on-disk config."""
+
+
+class ConfigVersionRequiredError(TypeError):
+    """A full replacement was passed through the versioned-save API."""
+
+
+class _VersionedConfig(dict):
+    """Mutable dict carrying the disk version from which it was loaded."""
+
+    def __init__(self, *args, config_path: str, config_version: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._config_path = config_path
+        self._config_version = config_version
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(
+            config_path=self._config_path,
+            config_version=self._config_version,
+        )
+        memo[id(self)] = copied
+        for key, value in self.items():
+            copied[copy.deepcopy(key, memo)] = copy.deepcopy(value, memo)
+        return copied
+
+    def __copy__(self):
+        return type(self)(
+            self,
+            config_path=self._config_path,
+            config_version=self._config_version,
+        )
+
+    def copy(self):
+        return self.__copy__()
+
+    def update(self, *args, **kwargs):
+        # A few long-lived wizard flows refresh their original dict in place
+        # after a delegated config writer commits. Carry the refreshed token
+        # with that full mapping so their eventual save checks the right disk
+        # version instead of producing a false conflict.
+        if args and isinstance(args[0], _VersionedConfig):
+            self._config_path = args[0]._config_path
+            self._config_version = args[0]._config_version
+        super().update(*args, **kwargs)
+
+
+def _represent_versioned_config(dumper, data):
+    return dumper.represent_dict(data)
+
+
+yaml.add_representer(_VersionedConfig, _represent_versioned_config)
+yaml.Dumper.add_representer(_VersionedConfig, _represent_versioned_config)
+yaml.SafeDumper.add_representer(_VersionedConfig, _represent_versioned_config)
+if hasattr(yaml, "CDumper"):
+    yaml.CDumper.add_representer(_VersionedConfig, _represent_versioned_config)
+if hasattr(yaml, "CSafeDumper"):
+    yaml.CSafeDumper.add_representer(_VersionedConfig, _represent_versioned_config)
+
+
+def _config_content_version(path: Path) -> str:
+    try:
+        return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+    except FileNotFoundError:
+        return "missing"
+
+
+def _versioned_config(data: Dict[str, Any], path: Path, version: str) -> _VersionedConfig:
+    return _VersionedConfig(data, config_path=str(path), config_version=version)
+
+
 def config_snapshot_digest(path: Optional[Path] = None) -> str:
     """Return the installer-compatible digest of one regular config file."""
     target = path or get_config_path()
@@ -254,6 +327,80 @@ def config_snapshot_digest(path: Optional[Path] = None) -> str:
     }
     serialized = json.dumps(record, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def compare_restore_config(
+    expected_digest: str,
+    backup_path: Optional[Path] = None,
+    *,
+    backup_absent: bool = False,
+) -> str:
+    """Restore a snapshot iff config still matches a transaction receipt.
+
+    Comparison and atomic replacement both happen while holding the same
+    cross-process write lock used by compliant Hermes config writers.
+    """
+    if not isinstance(expected_digest, str) or not re.fullmatch(
+        r"[A-Fa-f0-9]{64}", expected_digest,
+    ):
+        raise ValueError("expected config digest must be 64 hexadecimal characters")
+    if backup_absent == (backup_path is not None):
+        raise ValueError("provide exactly one config backup path or backup_absent=True")
+    backup = Path(backup_path) if backup_path is not None else None
+    with config_write_lock():
+        config_path = get_config_path()
+        if backup_absent:
+            if not config_path.exists():
+                return "unchanged"
+            if config_snapshot_digest(config_path) != expected_digest:
+                raise ConfigConflictError(
+                    "config.yaml changed after the installer transaction; restore refused"
+                )
+            config_path.unlink()
+            result = "restored"
+        else:
+            assert backup is not None
+            backup_stat = backup.lstat()
+            if backup.is_symlink() or not stat.S_ISREG(backup_stat.st_mode):
+                raise ValueError("config backup must be a regular non-symlink file")
+            if backup_stat.st_size > 16 * 1024 * 1024:
+                raise ValueError("config backup exceeds the restore size limit")
+            backup_digest = config_snapshot_digest(backup)
+            try:
+                current_digest = config_snapshot_digest(config_path)
+            except FileNotFoundError as error:
+                raise ConfigConflictError(
+                    "config.yaml disappeared after the installer transaction; restore refused"
+                ) from error
+            if current_digest == backup_digest:
+                return "unchanged"
+            if current_digest != expected_digest:
+                raise ConfigConflictError(
+                    "config.yaml changed after the installer transaction; restore refused"
+                )
+
+            fd, temporary = tempfile.mkstemp(
+                dir=str(config_path.parent), prefix=".config-restore-", suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "wb", closefd=True) as output:
+                    output.write(backup.read_bytes())
+                    output.flush()
+                    os.fchmod(output.fileno(), stat.S_IMODE(backup_stat.st_mode))
+                    os.fsync(output.fileno())
+                atomic_replace(temporary, config_path)
+            except Exception:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+            result = "restored"
+        path_key = str(config_path)
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(path_key, None)
+        return result
 
 
 @contextlib.contextmanager
@@ -360,7 +507,6 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
 })
-import yaml
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
@@ -5311,24 +5457,34 @@ def read_raw_config() -> Dict[str, Any]:
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
         except (FileNotFoundError, OSError):
-            return {}
+            return _versioned_config({}, config_path, "missing")
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
         if cached is not None and cached[:2] == cache_key:
             return copy.deepcopy(cached[2])
 
+        raw_bytes = None
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
+            raw_bytes = config_path.read_bytes()
+            data = yaml.safe_load(raw_bytes.decode("utf-8")) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
-            return {}
+            return _versioned_config(
+                {}, config_path,
+                f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+                if raw_bytes is not None else "unreadable",
+            )
 
         if not isinstance(data, dict):
             data = {}
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
-        return data
+        versioned = _versioned_config(
+            data,
+            config_path,
+            f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}",
+        )
+        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(versioned))
+        return versioned
 
 
 def load_config() -> Dict[str, Any]:
@@ -5476,11 +5632,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        config_version = "missing"
 
         if cache_key is not None:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+                raw_bytes = config_path.read_bytes()
+                config_version = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+                user_config = yaml.safe_load(raw_bytes.decode("utf-8")) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -5494,7 +5652,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 _warn_config_parse_failure(config_path, e)
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        expanded = _expand_env_vars(normalized)
+        expanded = _versioned_config(
+            _expand_env_vars(normalized), config_path, config_version,
+        )
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_key is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -5593,8 +5753,7 @@ _COMMENTED_SECTIONS = """
 """
 
 
-def save_config(config: Dict[str, Any]):
-    """Save configuration to ~/.hermes/config.yaml."""
+def _save_config(config: Dict[str, Any], *, replacement: bool) -> None:
     with config_write_lock():
         if is_managed():
             managed_error("save configuration")
@@ -5603,6 +5762,20 @@ def save_config(config: Dict[str, Any]):
 
         ensure_hermes_home()
         config_path = get_config_path()
+        if not replacement:
+            expected_path = getattr(config, "_config_path", None)
+            expected_version = getattr(config, "_config_version", None)
+            if expected_path is None or expected_version is None:
+                raise ConfigVersionRequiredError(
+                    "save_config() requires a dict returned by load_config() or "
+                    "read_raw_config(); use save_config_replacement() for an explicit full replacement"
+                )
+            if expected_path != str(config_path):
+                raise ConfigConflictError("loaded config belongs to a different Hermes profile")
+            if _config_content_version(config_path) != expected_version:
+                raise ConfigConflictError(
+                    "config.yaml changed after it was loaded; reload and retry the update"
+                )
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         normalized = current_normalized
         raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
@@ -5635,6 +5808,18 @@ def save_config(config: Dict[str, Any]):
         )
         _secure_file(config_path)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        if isinstance(config, _VersionedConfig):
+            config._config_version = _config_content_version(config_path)
+
+
+def save_config(config: Dict[str, Any]):
+    """CAS-save a configuration returned by ``load_config()``."""
+    _save_config(config, replacement=False)
+
+
+def save_config_replacement(config: Dict[str, Any]):
+    """Explicitly replace config.yaml without a prior loaded-version contract."""
+    _save_config(config, replacement=True)
 
 
 def load_env() -> Dict[str, str]:
@@ -6263,7 +6448,7 @@ def edit_config():
     
     # Ensure config exists
     if not config_path.exists():
-        save_config(DEFAULT_CONFIG)
+        save_config_replacement(DEFAULT_CONFIG)
         print(f"Created {config_path}")
     
     # Find editor
@@ -6392,7 +6577,22 @@ def config_command(args):
     
     elif subcmd == "env-path":
         print(get_env_path())
-    
+
+    elif subcmd == "compare-restore":
+        try:
+            result = compare_restore_config(
+                getattr(args, "expected_digest", ""),
+                Path(args.backup_path) if getattr(args, "backup_path", None) else None,
+                backup_absent=getattr(args, "backup_absent", False),
+            )
+        except ConfigConflictError:
+            print(
+                "Hermes config changed concurrently; restore refused for manual inspection.",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        print(f"config-restore:{result}")
+
     elif subcmd == "migrate":
         print()
         print(color("🔄 Checking configuration for updates...", Colors.CYAN, Colors.BOLD))

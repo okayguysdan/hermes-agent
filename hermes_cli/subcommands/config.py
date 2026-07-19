@@ -46,4 +46,11 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     # config migrate
     config_subparsers.add_parser("migrate", help="Update config with new options")
 
+    config_restore = config_subparsers.add_parser(
+        "compare-restore", help="Atomically restore a transaction-bound config snapshot"
+    )
+    config_restore.add_argument("expected_digest")
+    config_restore.add_argument("backup_path", nargs="?")
+    config_restore.add_argument("--backup-absent", action="store_true")
+
     config_parser.set_defaults(func=cmd_config)

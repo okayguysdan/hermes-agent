@@ -2916,7 +2916,8 @@ def run_setup_wizard(args):
 
     reset_requested = bool(getattr(args, "reset", False))
     if reset_requested:
-        save_config(copy.deepcopy(DEFAULT_CONFIG))
+        from hermes_cli.config import save_config_replacement
+        save_config_replacement(copy.deepcopy(DEFAULT_CONFIG))
         print_success("Configuration reset to defaults.")
 
     reconfigure_requested = bool(getattr(args, "reconfigure", False))

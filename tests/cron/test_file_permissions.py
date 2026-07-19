@@ -88,8 +88,8 @@ class TestConfigFilePermissions(unittest.TestCase):
         config_path = Path(self.tmpdir) / "config.yaml"
         with patch("hermes_cli.config.get_config_path", return_value=config_path), \
              patch("hermes_cli.config.ensure_hermes_home"):
-            from hermes_cli.config import save_config
-            save_config({"model": "test/model"})
+            from hermes_cli.config import save_config_replacement
+            save_config_replacement({"model": "test/model"})
 
             file_mode = stat.S_IMODE(os.stat(config_path).st_mode)
             self.assertEqual(file_mode, 0o600)

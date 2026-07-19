@@ -860,8 +860,8 @@ def test_logout_clears_stale_active_codex_without_provider_credentials(tmp_path,
     assert "provider: auto" in config_text
 
 
-def test_reset_config_provider_uses_atomic_yaml_write(tmp_path, monkeypatch):
-    """Logout config reset should delegate the YAML write atomically."""
+def test_reset_config_provider_uses_versioned_save(tmp_path, monkeypatch):
+    """Logout config reset should use the shared versioned config save."""
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -878,15 +878,13 @@ def test_reset_config_provider_uses_atomic_yaml_write(tmp_path, monkeypatch):
 
     from hermes_cli.auth import _reset_config_provider
 
-    def _boom(path, data, **kwargs):
-        assert path == config_path
+    def _boom(data):
         assert data["model"]["provider"] == "auto"
         assert data["model"]["base_url"] == "https://openrouter.ai/api/v1"
-        assert kwargs["sort_keys"] is False
-        raise OSError("simulated atomic write failure")
+        raise OSError("simulated versioned write failure")
 
-    with patch("hermes_cli.auth.atomic_yaml_write", side_effect=_boom) as mock_write:
-        with pytest.raises(OSError, match="simulated atomic write failure"):
+    with patch("hermes_cli.auth.save_config", side_effect=_boom) as mock_write:
+        with pytest.raises(OSError, match="simulated versioned write failure"):
             _reset_config_provider()
 
     assert mock_write.call_count == 1

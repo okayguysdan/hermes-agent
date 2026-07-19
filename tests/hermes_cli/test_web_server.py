@@ -2419,10 +2419,10 @@ class TestConfigRoundTrip:
 
     def test_round_trip_preserves_model_subkeys(self):
         """Save and reload should not lose model.provider, model.base_url, etc."""
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli.config import load_config, save_config_replacement
 
         # Set up a config with model as a dict (the common user config form)
-        save_config({
+        save_config_replacement({
             "model": {
                 "default": "anthropic/claude-sonnet-4",
                 "provider": "openrouter",
@@ -3538,10 +3538,10 @@ class TestModelContextLength:
     def test_denormalize_writes_context_length_into_model_dict(self):
         """denormalize should write model_context_length back into model dict."""
         from hermes_cli.web_server import _denormalize_config_from_web
-        from hermes_cli.config import save_config
+        from hermes_cli.config import save_config_replacement
 
         # Set up disk config with model as a dict
-        save_config({
+        save_config_replacement({
             "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"}
         })
 
@@ -3556,9 +3556,9 @@ class TestModelContextLength:
     def test_denormalize_zero_removes_context_length(self):
         """denormalize with model_context_length=0 should remove context_length key."""
         from hermes_cli.web_server import _denormalize_config_from_web
-        from hermes_cli.config import save_config
+        from hermes_cli.config import save_config_replacement
 
-        save_config({
+        save_config_replacement({
             "model": {
                 "default": "anthropic/claude-opus-4.6",
                 "provider": "openrouter",
@@ -3576,10 +3576,10 @@ class TestModelContextLength:
     def test_denormalize_upgrades_bare_string_to_dict(self):
         """denormalize should upgrade bare string model to dict when context_length set."""
         from hermes_cli.web_server import _denormalize_config_from_web
-        from hermes_cli.config import save_config
+        from hermes_cli.config import save_config_replacement
 
         # Disk has model as bare string
-        save_config({"model": "anthropic/claude-sonnet-4"})
+        save_config_replacement({"model": "anthropic/claude-sonnet-4"})
 
         result = _denormalize_config_from_web({
             "model": "anthropic/claude-sonnet-4",
@@ -3592,9 +3592,9 @@ class TestModelContextLength:
     def test_denormalize_bare_string_stays_string_when_zero(self):
         """denormalize should keep bare string model as string when context_length=0."""
         from hermes_cli.web_server import _denormalize_config_from_web
-        from hermes_cli.config import save_config
+        from hermes_cli.config import save_config_replacement
 
-        save_config({"model": "anthropic/claude-sonnet-4"})
+        save_config_replacement({"model": "anthropic/claude-sonnet-4"})
 
         result = _denormalize_config_from_web({
             "model": "anthropic/claude-sonnet-4",
@@ -3605,9 +3605,9 @@ class TestModelContextLength:
     def test_denormalize_coerces_string_context_length(self):
         """denormalize should handle string model_context_length from frontend."""
         from hermes_cli.web_server import _denormalize_config_from_web
-        from hermes_cli.config import save_config
+        from hermes_cli.config import save_config_replacement
 
-        save_config({
+        save_config_replacement({
             "model": {"default": "test/model", "provider": "openrouter"}
         })
 
