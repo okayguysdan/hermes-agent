@@ -26,6 +26,15 @@ class TestHomeChannelRoundtrip:
         assert restored.chat_id == "999"
         assert restored.name == "general"
 
+    def test_from_dict_normalizes_null_chat_id_to_empty(self):
+        restored = HomeChannel.from_dict({
+            "platform": "bluebubbles",
+            "chat_id": None,
+            "name": "Home",
+        })
+
+        assert restored.chat_id == ""
+
 
 class TestPlatformConfigRoundtrip:
     def test_to_dict_from_dict(self):

@@ -263,9 +263,13 @@ class HomeChannel:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
+        raw_chat_id = data["chat_id"]
         return cls(
             platform=Platform(data["platform"]),
-            chat_id=str(data["chat_id"]),
+            # YAML null must not become the apparently configured string
+            # "None". Keep the dataclass string contract while representing
+            # an absent destination as empty/fail-closed.
+            chat_id="" if raw_chat_id is None else str(raw_chat_id),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
         )

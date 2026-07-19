@@ -414,6 +414,32 @@ class TestGatewayRuntimeStatus:
         assert disconnected["home_target_ready"] is False
         assert disconnected["home_target_checked_at"] != ready["home_target_checked_at"]
 
+    def test_bluebubbles_direct_connected_write_without_readiness_fails_closed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        timestamps = iter((
+            "2026-07-19T10:00:00+00:00",
+            "2026-07-19T10:01:00+00:00",
+            "2026-07-19T10:02:00+00:00",
+        ))
+        monkeypatch.setattr(status, "_utc_now_iso", lambda: next(timestamps))
+
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="connected",
+            home_target_ready=True,
+        )
+        ready = status.read_runtime_status()["platforms"]["bluebubbles"]
+
+        status.write_runtime_status(
+            platform="bluebubbles",
+            platform_state="connected",
+        )
+        direct = status.read_runtime_status()["platforms"]["bluebubbles"]
+
+        assert ready["home_target_ready"] is True
+        assert direct["home_target_ready"] is False
+        assert direct["home_target_checked_at"] != ready["home_target_checked_at"]
+
     def test_gateway_startup_clears_stale_platform_status(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         status.write_runtime_status(

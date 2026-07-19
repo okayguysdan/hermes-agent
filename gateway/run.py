@@ -3326,9 +3326,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if platform == Platform.BLUEBUBBLES.value:
                 home = self.config.get_home_channel(Platform.BLUEBUBBLES)
-                chat_id = getattr(home, "chat_id", "") if home is not None else ""
+                raw_chat_id = getattr(home, "chat_id", None) if home is not None else None
+                chat_id = raw_chat_id.strip() if isinstance(raw_chat_id, str) else ""
                 status_fields["home_target_ready"] = bool(
-                    platform_state == "connected" and str(chat_id).strip()
+                    platform_state == "connected"
+                    and chat_id
+                    and chat_id.casefold() not in {"none", "null", "nil", "~"}
                 )
             write_runtime_status(**status_fields)
         except Exception:

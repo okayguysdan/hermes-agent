@@ -65,6 +65,51 @@ def test_connected_bluebubbles_with_blank_home_is_not_ready():
     assert writer.call_args.kwargs["home_target_ready"] is False
 
 
+def test_connected_bluebubbles_with_null_home_chat_id_is_not_ready():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={
+        Platform.BLUEBUBBLES: PlatformConfig(
+            enabled=True,
+            home_channel=HomeChannel(
+                platform=Platform.BLUEBUBBLES,
+                chat_id=None,  # type: ignore[arg-type]
+                name="Home",
+            ),
+        ),
+    })
+
+    with patch("gateway.status.write_runtime_status") as writer:
+        runner._update_platform_runtime_status(
+            "bluebubbles",
+            platform_state="connected",
+        )
+
+    assert writer.call_args.kwargs["home_target_ready"] is False
+
+
+def test_connected_bluebubbles_with_null_like_home_is_not_ready():
+    for null_like in ("none", "NULL", "nil", "~"):
+        runner = _runner_with_home(null_like)
+        with patch("gateway.status.write_runtime_status") as writer:
+            runner._update_platform_runtime_status(
+                "bluebubbles",
+                platform_state="connected",
+            )
+        assert writer.call_args.kwargs["home_target_ready"] is False
+
+
+def test_fatal_and_retrying_bluebubbles_states_force_home_not_ready():
+    runner = _runner_with_home("SENTINEL_PRIVATE_HOME_TARGET")
+
+    for platform_state in ("fatal", "retrying"):
+        with patch("gateway.status.write_runtime_status") as writer:
+            runner._update_platform_runtime_status(
+                "bluebubbles",
+                platform_state=platform_state,
+            )
+        assert writer.call_args.kwargs["home_target_ready"] is False
+
+
 def test_non_bluebubbles_status_does_not_add_home_readiness_fields():
     runner = _runner_with_home("SENTINEL_PRIVATE_HOME_TARGET")
 
