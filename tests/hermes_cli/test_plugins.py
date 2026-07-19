@@ -483,6 +483,20 @@ class TestPluginDiscovery:
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
 
+    def test_force_rediscover_invokes_plugin_unload_before_clearing(self, monkeypatch):
+        calls = []
+        mgr = PluginManager()
+        mgr._hooks["on_plugin_unload"] = [
+            lambda **kwargs: calls.append(kwargs["reason"]),
+        ]
+        mgr._discovered = True
+        monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
+
+        mgr.discover_and_load(force=True)
+
+        assert "on_plugin_unload" in VALID_HOOKS
+        assert calls == ["reload"]
+
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
 

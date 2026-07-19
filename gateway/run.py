@@ -6082,6 +6082,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_plugin_hook
+                _invoke_plugin_hook("on_plugin_unload", reason="gateway_shutdown")
+            except Exception as _e:
+                logger.debug("plugin shutdown hooks failed: %s", _e)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -6692,6 +6698,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #   {"action": "respond", "text":  ...}     -> return before auth/commands/model
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -6709,6 +6716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hook_results = []
 
             _rewrite_texts = []
+            _response_texts = []
             for _result in _hook_results:
                 if not isinstance(_result, dict):
                     continue
@@ -6725,17 +6733,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
                         _rewrite_texts.append(_new_text)
+                if _action == "respond":
+                    _response_text = _result.get("text")
+                    if isinstance(_response_text, str) and _response_text:
+                        _response_texts.append(_response_text)
 
             _distinct_rewrites = list(dict.fromkeys(_rewrite_texts))
-            if len(_distinct_rewrites) > 1:
+            _distinct_responses = list(dict.fromkeys(_response_texts))
+            if (
+                len(_distinct_rewrites) > 1
+                or len(_distinct_responses) > 1
+                or (_distinct_rewrites and _distinct_responses)
+            ):
                 logger.warning(
-                    "pre_gateway_dispatch conflicting rewrites; dropping message: "
-                    "platform=%s chat=%s rewrite_count=%d",
+                    "pre_gateway_dispatch conflicting terminal actions; dropping message: "
+                    "platform=%s chat=%s rewrite_count=%d response_count=%d",
                     source.platform.value if source.platform else "unknown",
                     source.chat_id or "unknown",
                     len(_distinct_rewrites),
+                    len(_distinct_responses),
                 )
                 return None
+            if _distinct_responses:
+                return _distinct_responses[0]
             if _distinct_rewrites:
                 event = dataclasses.replace(event, text=_distinct_rewrites[0])
                 source = event.source

@@ -217,6 +217,73 @@ async def test_hook_conflicting_rewrites_fail_closed(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_hook_internal_response_bypasses_auth_commands_and_model(monkeypatch):
+    """A plugin response returns directly without re-entering message dispatch."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "respond", "text": "Approval queued."}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(return_value="model-ran")
+
+    result = await runner._handle_message(_make_event("/ooo-approve web 1"))
+
+    assert result == "Approval queued."
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_hook_allow_cannot_bypass_later_internal_response(monkeypatch):
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "allow"},
+                {"action": "respond", "text": "Approval refused."},
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+
+    assert await runner._handle_message(_make_event("/ooo-approve web 1")) == "Approval refused."
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_hook_response_conflicts_fail_closed(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    for results in (
+        [
+            {"action": "respond", "text": "Approval queued."},
+            {"action": "rewrite", "text": "/help"},
+        ],
+        [
+            {"action": "respond", "text": "Approval queued."},
+            {"action": "respond", "text": "Different response."},
+        ],
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda name, **kwargs: results if name == "pre_gateway_dispatch" else [],
+        )
+        runner, _adapter = _make_runner(Platform.WHATSAPP)
+        runner._handle_message_with_agent = AsyncMock(return_value="model-ran")
+
+        assert await runner._handle_message(_make_event("/ooo-approve web 1")) is None
+        runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_hook_exception_does_not_break_dispatch(monkeypatch):
     """A raising plugin hook does not break the gateway."""
     _clear_auth_env(monkeypatch)

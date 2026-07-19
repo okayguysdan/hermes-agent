@@ -143,6 +143,10 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Teardown hook for process shutdown and force rediscovery. Plugins that
+    # own sockets, threads, or other exclusive resources release them here.
+    # Kwargs: reason: "reload" | "gateway_shutdown".
+    "on_plugin_unload",
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
@@ -1133,6 +1137,7 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            self.invoke_hook("on_plugin_unload", reason="reload")
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
