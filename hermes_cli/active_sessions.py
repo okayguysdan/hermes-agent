@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -231,6 +232,29 @@ class ActiveSessionLease:
         release_active_session(self)
 
 
+def _kanban_worker_metadata() -> dict[str, str]:
+    """Return the complete dispatcher fence, or nothing for legacy/partial workers."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not task_id:
+        return {}
+    if not (
+        re.fullmatch(r"[A-Za-z0-9:_-]{1,120}", task_id)
+        and re.fullmatch(r"[1-9][0-9]{0,18}", run_id)
+        and 1 <= len(claim_lock) <= 500
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,120}", profile)
+    ):
+        return {}
+    return {
+        "kanban_task_id": task_id,
+        "kanban_run_id": run_id,
+        "kanban_claim_lock": claim_lock,
+        "kanban_profile": profile,
+    }
+
+
 def try_acquire_active_session(
     *,
     session_id: str,
@@ -263,9 +287,13 @@ def try_acquire_active_session(
         "started_at": now,
         "updated_at": now,
     }
-    if metadata:
+    complete_metadata = {
+        **(metadata or {}),
+        **_kanban_worker_metadata(),
+    }
+    if complete_metadata:
         entry["metadata"] = {
-            str(k): v for k, v in metadata.items() if isinstance(k, str)
+            str(k): v for k, v in complete_metadata.items() if isinstance(k, str)
         }
 
     state_path = _state_path()

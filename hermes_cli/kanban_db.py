@@ -70,6 +70,7 @@ new locking.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -102,6 +103,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+_SKILL_PREFLIGHT_LOCK = threading.RLock()
 
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
@@ -2198,6 +2200,18 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # The fast-path lookup above is advisory only. BEGIN IMMEDIATE
+                # serializes creators, so repeat it while holding the writer
+                # lock to make deterministic automation keys truly converge.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -2975,6 +2989,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    preflight_fence: Optional[tuple[Optional[str], ...]] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3030,8 +3045,21 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        fence_sql = ""
+        fence_params: tuple[Optional[str], ...] = ()
+        if preflight_fence is not None:
+            if len(preflight_fence) == 2:
+                fence_sql = " AND assignee IS ? AND skills IS ?"
+            elif len(preflight_fence) == 4:
+                fence_sql = (
+                    " AND assignee IS ? AND skills IS ? "
+                    "AND body IS ? AND idempotency_key IS ?"
+                )
+            else:
+                raise ValueError("preflight_fence must contain 2 or 4 values")
+            fence_params = preflight_fence
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -3040,8 +3068,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               {fence_sql}
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, *fence_params),
         )
         if cur.rowcount != 1:
             return None
@@ -3089,6 +3118,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    preflight_fence: Optional[tuple[Optional[str], Optional[str]]] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -3106,8 +3136,13 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        fence_sql = ""
+        fence_params: tuple[Optional[str], ...] = ()
+        if preflight_fence is not None:
+            fence_sql = " AND assignee IS ? AND skills IS ?"
+            fence_params = preflight_fence
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -3116,8 +3151,9 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               {fence_sql}
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, *fence_params),
         )
         if cur.rowcount != 1:
             return None
@@ -4912,6 +4948,9 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    preflight_blocked: list[str] = field(default_factory=list)
+    """Task ids permanently blocked before claim because their assigned
+    profile cannot resolve one or more forced task skills."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6022,6 +6061,381 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _task_skills_from_db(
+    raw_skills: Optional[str],
+) -> tuple[list[str], Optional[dict[str, Any]]]:
+    """Decode a forced-skill snapshot, preserving corruption as a hard error."""
+    if raw_skills is None:
+        return [], None
+    try:
+        parsed = json.loads(raw_skills)
+    except (TypeError, ValueError):
+        parsed = None
+    if (
+        not isinstance(parsed, list)
+        or any(not isinstance(skill, str) or not skill.strip() for skill in parsed)
+    ):
+        return [], {
+            "code": "task_skills_malformed",
+            "message": "The task's forced-skill snapshot is malformed.",
+            "action": (
+                "Repair the task skills snapshot, then unblock the task and retry."
+            ),
+        }
+    return [skill.strip() for skill in parsed], None
+
+
+def _profile_config_preflight_error(
+    profile: str,
+    profile_dir: Path,
+) -> Optional[dict[str, Any]]:
+    """Return an actionable diagnostic when required profile config is unusable."""
+    config_path = profile_dir / "config.yaml"
+    if not config_path.is_file():
+        return {
+            "code": "profile_config_missing",
+            "profile": profile,
+            "config_path": str(config_path),
+            "message": f"Profile '{profile}' has no readable config.yaml.",
+            "action": (
+                f"Create or repair {config_path} before dispatching tasks with "
+                "forced skills."
+            ),
+        }
+    try:
+        import yaml
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "code": "profile_config_malformed",
+            "profile": profile,
+            "config_path": str(config_path),
+            "message": f"Profile '{profile}' config.yaml could not be parsed.",
+            "action": (
+                f"Repair the YAML in {config_path}, then unblock the task and retry."
+            ),
+        }
+    if not isinstance(config, dict):
+        return {
+            "code": "profile_config_malformed",
+            "profile": profile,
+            "config_path": str(config_path),
+            "message": f"Profile '{profile}' config.yaml must contain a YAML mapping.",
+            "action": (
+                f"Replace {config_path} with a valid Hermes profile mapping, then "
+                "unblock the task and retry."
+            ),
+        }
+    skills_config = config.get("skills")
+    if skills_config is not None and not isinstance(skills_config, dict):
+        return {
+            "code": "profile_config_malformed",
+            "profile": profile,
+            "config_path": str(config_path),
+            "message": f"Profile '{profile}' config.yaml has a non-mapping skills section.",
+            "action": (
+                f"Make skills a YAML mapping in {config_path}, then unblock the task "
+                "and retry."
+            ),
+        }
+    external_dirs = (
+        skills_config.get("external_dirs")
+        if isinstance(skills_config, dict)
+        else None
+    )
+    if isinstance(external_dirs, str) or external_dirs is None:
+        return None
+    if not isinstance(external_dirs, list) or any(
+        not isinstance(entry, str) for entry in external_dirs
+    ):
+        return {
+            "code": "profile_config_malformed",
+            "profile": profile,
+            "config_path": str(config_path),
+            "message": (
+                f"Profile '{profile}' skills.external_dirs must be a string or "
+                "a list of strings."
+            ),
+            "action": (
+                f"Repair skills.external_dirs in {config_path}, then unblock the "
+                "task and retry."
+            ),
+        }
+    return None
+
+
+def _preflight_task_skills(
+    profile: str,
+    skills: Optional[Iterable[str]],
+    *,
+    task_body: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Resolve forced skills exactly as the assigned worker CLI will resolve them."""
+    raw_required = [
+        str(skill).strip() for skill in (skills or ()) if str(skill).strip()
+    ]
+    required = list(dict.fromkeys(raw_required))
+
+    context: Optional[dict[str, Any]] = None
+    markers = re.findall(
+        r"(?m)^OPENSEASON_TASK_CONTEXT=([^\r\n]*)$",
+        task_body or "",
+    )
+    is_correlated = bool(markers) or bool(
+        idempotency_key and idempotency_key.startswith("course-data:")
+    )
+    if is_correlated:
+        mismatches: list[str] = []
+        if len(markers) != 1:
+            mismatches.append("OPENSEASON_TASK_CONTEXT")
+        else:
+            try:
+                encoded = markers[0]
+                if re.fullmatch(r"[A-Za-z0-9_-]+", encoded) is None:
+                    raise ValueError("context must be unpadded base64url")
+                padded = encoded + "=" * (-len(encoded) % 4)
+                decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+                canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+                if canonical != encoded:
+                    raise ValueError("context is not canonical base64url")
+                parsed = json.loads(decoded.decode("utf-8"))
+                context = parsed if isinstance(parsed, dict) else None
+            except Exception:
+                context = None
+            if context is None:
+                mismatches.append("OPENSEASON_TASK_CONTEXT")
+
+        expected_keys = {
+            "schema", "runId", "jobId", "attempt", "dispatchKey", "profile",
+            "profileRelease", "skillDigest",
+        }
+        if context is not None:
+            if set(context) != expected_keys:
+                mismatches.append("contextSchema")
+            if context.get("schema") != "openseason-course-data-task/v1":
+                mismatches.append("schema")
+            for field_name in ("runId", "jobId", "dispatchKey", "profile",
+                               "profileRelease", "skillDigest"):
+                if not isinstance(context.get(field_name), str) or not context[field_name]:
+                    mismatches.append(field_name)
+            attempt = context.get("attempt")
+            if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+                mismatches.append("attempt")
+            if context.get("profile") != profile:
+                mismatches.append("profile")
+            dispatch_key = (
+                f"course-data:{context.get('jobId')}:{context.get('attempt')}"
+            )
+            if context.get("dispatchKey") != dispatch_key:
+                mismatches.append("dispatchKey")
+            if idempotency_key != context.get("dispatchKey"):
+                mismatches.append("idempotencyKey")
+            release_value = context.get("profileRelease")
+            release_parts = (
+                release_value.split("/") if isinstance(release_value, str) else []
+            )
+            if (
+                len(release_parts) != 2
+                or not release_parts[0]
+                or re.fullmatch(r"v[1-9][0-9]*", release_parts[1]) is None
+            ):
+                mismatches.append("profileRelease")
+            elif raw_required != [release_parts[0]]:
+                mismatches.append("skills")
+            if re.fullmatch(r"[0-9a-f]{64}", str(context.get("skillDigest", ""))) is None:
+                mismatches.append("skillDigest")
+
+        if mismatches:
+            return {
+                "code": "correlated_skill_fence_mismatch",
+                "profile": profile,
+                "required_skills": required,
+                "mismatches": list(dict.fromkeys(mismatches)),
+                "message": "The correlated OpenSeason task fence is invalid.",
+                "action": (
+                    "Repair the producer context and pinned release, then unblock "
+                    "the task and retry."
+                ),
+            }
+
+    if not required:
+        return None
+
+    from hermes_cli.profiles import get_profile_dir
+
+    profile_dir = get_profile_dir(profile)
+    config_error = _profile_config_preflight_error(profile, profile_dir)
+    if config_error is not None:
+        config_error["required_skills"] = required
+        return config_error
+
+    failures: list[dict[str, str]] = []
+    resolved_skills: dict[str, tuple[dict[str, Any], Optional[Path], str]] = {}
+    try:
+        from agent.skill_commands import _load_skill_payload
+        from agent.skill_utils import _external_dirs_cache_clear
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools import skills_tool
+
+        with _SKILL_PREFLIGHT_LOCK:
+            token = set_hermes_home_override(str(profile_dir))
+            previous_home = skills_tool.HERMES_HOME
+            previous_skills_dir = skills_tool.SKILLS_DIR
+            skills_tool.HERMES_HOME = profile_dir
+            skills_tool.SKILLS_DIR = profile_dir / "skills"
+            _external_dirs_cache_clear()
+            try:
+                for skill in required:
+                    try:
+                        loaded = _load_skill_payload(skill)
+                    except Exception as exc:
+                        failures.append(
+                            {
+                                "skill": skill,
+                                "error": f"Skill resolver failed: {type(exc).__name__}",
+                            }
+                        )
+                        continue
+                    if loaded is None:
+                        try:
+                            resolved = json.loads(
+                                skills_tool.skill_view(skill, preprocess=False)
+                            )
+                        except Exception as exc:
+                            resolved = {
+                                "success": False,
+                                "error": (
+                                    f"Skill resolver failed: {type(exc).__name__}"
+                                ),
+                            }
+                        error = (
+                            str(resolved.get("error") or "Skill could not be resolved.")
+                            if isinstance(resolved, dict)
+                            else "Skill resolver returned an invalid response."
+                        )
+                        failures.append({"skill": skill, "error": error})
+                    else:
+                        resolved_skills[skill] = loaded
+            finally:
+                skills_tool.HERMES_HOME = previous_home
+                skills_tool.SKILLS_DIR = previous_skills_dir
+                _external_dirs_cache_clear()
+                reset_hermes_home_override(token)
+    except Exception as exc:
+        return {
+            "code": "skill_resolver_unavailable",
+            "profile": profile,
+            "required_skills": required,
+            "message": (
+                f"Could not run the forced-skill resolver for profile '{profile}'."
+            ),
+            "action": (
+                "Repair the Hermes skill runtime, then unblock the task and retry."
+            ),
+            "resolution_errors": [
+                {"skill": skill, "error": type(exc).__name__}
+                for skill in required
+            ],
+        }
+
+    if not failures and context is not None:
+        release_name, release_version = context["profileRelease"].split("/")
+        loaded = resolved_skills.get(release_name)
+        mismatches = []
+        if loaded is None or loaded[1] is None:
+            mismatches.append("skillResolution")
+        else:
+            skill_dir = loaded[1]
+            skill_path = skill_dir / "SKILL.md"
+            manifest_path = skill_dir / "manifest.json"
+            try:
+                skill_bytes = skill_path.read_bytes()
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = None
+                mismatches.append("manifest")
+            if isinstance(manifest, dict):
+                computed_digest = hashlib.sha256(skill_bytes).hexdigest()
+                if manifest.get("name") != release_name:
+                    mismatches.append("name")
+                if manifest.get("version") != release_version:
+                    mismatches.append("profileRelease")
+                if manifest.get("profile") != profile:
+                    mismatches.append("profile")
+                if (
+                    manifest.get("skillDigest") != context["skillDigest"]
+                    or computed_digest != context["skillDigest"]
+                ):
+                    mismatches.append("skillDigest")
+        if mismatches:
+            return {
+                "code": "correlated_skill_fence_mismatch",
+                "profile": profile,
+                "required_skills": required,
+                "mismatches": list(dict.fromkeys(mismatches)),
+                "message": "The resolved OpenSeason skill does not match its pinned release.",
+                "action": (
+                    "Restore the exact immutable release and manifest, then unblock "
+                    "the task and retry."
+                ),
+            }
+
+    if not failures:
+        return None
+
+    missing = [
+        failure["skill"]
+        for failure in failures
+        if "not found" in failure["error"].lower()
+        or "skills directory does not exist" in failure["error"].lower()
+    ]
+    all_missing = len(missing) == len(failures)
+    return {
+        "code": "missing_task_skills" if all_missing else "unresolved_task_skills",
+        "profile": profile,
+        "required_skills": required,
+        "missing_skills": missing,
+        "unresolved_skills": [failure["skill"] for failure in failures],
+        "resolution_errors": failures,
+        "message": (
+            f"Profile '{profile}' cannot resolve required task skill(s): "
+            f"{', '.join(failure['skill'] for failure in failures)}."
+        ),
+        "action": (
+            "Install the skills for that profile or repair its configured skill "
+            "paths, then unblock the task and retry."
+        ),
+    }
+
+
+def _block_missing_task_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    diagnostic: dict[str, Any],
+    expected_status: str,
+    expected_skills: Optional[str],
+) -> bool:
+    """Permanently block a dispatchable task without creating a worker attempt."""
+    payload = dict(diagnostic)
+    reason = f"{payload['message']} {payload['action']}"
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked' "
+            "WHERE id = ? AND status = ? AND claim_lock IS NULL "
+            "AND assignee IS ? AND skills IS ?",
+            (task_id, expected_status, profile, expected_skills),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "blocked", {"reason": reason, **payload})
+        _append_event(conn, task_id, "preflight_blocked", payload)
+    return True
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -6109,7 +6523,7 @@ def dispatch_once(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, skills, body, idempotency_key FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -6234,6 +6648,31 @@ def dispatch_once(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        task_skills, skill_diagnostic = _task_skills_from_db(row["skills"])
+        if skill_diagnostic is not None:
+            skill_diagnostic["profile"] = row_assignee
+        else:
+            skill_diagnostic = _preflight_task_skills(
+                row_assignee,
+                task_skills,
+                task_body=row["body"],
+                idempotency_key=row["idempotency_key"],
+            )
+        if skill_diagnostic is not None:
+            if not dry_run:
+                blocked = _block_missing_task_skills(
+                    conn,
+                    row["id"],
+                    profile=row_assignee,
+                    diagnostic=skill_diagnostic,
+                    expected_status="ready",
+                    expected_skills=row["skills"],
+                )
+                if blocked:
+                    result.preflight_blocked.append(row["id"])
+            else:
+                result.preflight_blocked.append(row["id"])
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -6279,7 +6718,17 @@ def dispatch_once(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            preflight_fence=(
+                row_assignee,
+                row["skills"],
+                row["body"],
+                row["idempotency_key"],
+            ),
+        )
         if claimed is None:
             continue
         try:
@@ -6345,7 +6794,7 @@ def dispatch_once(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, skills FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -6362,10 +6811,38 @@ def dispatch_once(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        _, skill_diagnostic = _task_skills_from_db(row["skills"])
+        if skill_diagnostic is not None:
+            skill_diagnostic["profile"] = row["assignee"]
+        else:
+            skill_diagnostic = _preflight_task_skills(
+                row["assignee"],
+                ["sdlc-review"],
+            )
+        if skill_diagnostic is not None:
+            if not dry_run:
+                blocked = _block_missing_task_skills(
+                    conn,
+                    row["id"],
+                    profile=row["assignee"],
+                    diagnostic=skill_diagnostic,
+                    expected_status="review",
+                    expected_skills=row["skills"],
+                )
+                if blocked:
+                    result.preflight_blocked.append(row["id"])
+            else:
+                result.preflight_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            preflight_fence=(row["assignee"], row["skills"]),
+        )
         if claimed is None:
             continue
         try:

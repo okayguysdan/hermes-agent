@@ -76,6 +76,55 @@ def test_active_session_lease_blocks_until_release(tmp_path, monkeypatch):
     assert active_sessions.active_session_registry_snapshot() == []
 
 
+def test_kanban_worker_session_records_the_complete_dispatch_fence(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-course-data")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim-course-data")
+    monkeypatch.setenv("HERMES_PROFILE", "data-entry")
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="worker-session",
+        surface="cli:quiet",
+        config={"max_concurrent_sessions": 2},
+    )
+
+    assert message is None
+    assert lease is not None
+    [entry] = active_sessions.active_session_registry_snapshot()
+    assert entry["metadata"]["kanban_task_id"] == "task-course-data"
+    assert entry["metadata"]["kanban_run_id"] == "42"
+    assert entry["metadata"]["kanban_claim_lock"] == "claim-course-data"
+    assert entry["metadata"]["kanban_profile"] == "data-entry"
+    assert entry["session_id"] == "worker-session"
+    assert entry["lease_id"] == lease.lease_id
+    assert entry["pid"] == os.getpid()
+    assert entry["process_start_time"] is not None
+    lease.release()
+
+
+def test_kanban_worker_session_omits_partial_dispatch_fences(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-course-data")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim-course-data")
+    monkeypatch.setenv("HERMES_PROFILE", "data-entry")
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="worker-session",
+        surface="cli:quiet",
+        config={"max_concurrent_sessions": 2},
+    )
+
+    assert message is None
+    assert lease is not None
+    [entry] = active_sessions.active_session_registry_snapshot()
+    assert "metadata" not in entry
+    lease.release()
+
+
 def test_active_session_registry_prunes_dead_pids(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))

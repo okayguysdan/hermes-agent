@@ -1,0 +1,10 @@
+name: openseason-course-data
+version: 1.0.0
+description: Task-scoped signed bridge for OpenSeason course-data research
+author: OpenSeason
+kind: standalone
+provides_tools:
+  - openseason_course_context
+  - openseason_course_heartbeat
+  - openseason_course_submit
+  - openseason_course_fail

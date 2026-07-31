@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
+import hashlib
+import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -40,6 +44,32 @@ def test_init_db_is_idempotent(kanban_home):
         tasks = kb.list_tasks(conn)
     assert len(tasks) == 1
     assert tasks[0].title == "persisted"
+
+
+def test_concurrent_idempotent_creators_converge_to_one_task(kanban_home):
+    """The deterministic key is serialized without requiring a schema migration."""
+    barrier = threading.Barrier(8)
+
+    def create():
+        with kb.connect() as conn:
+            barrier.wait()
+            return kb.create_task(
+                conn,
+                title="One fenced dispatch",
+                assignee="data-entry",
+                idempotency_key="course-data:job-1:1",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        task_ids = list(pool.map(lambda _index: create(), range(8)))
+
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            ("course-data:job-1:1",),
+        ).fetchall()
+    assert len(set(task_ids)) == 1
+    assert [row["id"] for row in rows] == [task_ids[0]]
 
 
 def test_init_creates_expected_tables(kanban_home):
@@ -1457,6 +1487,735 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
+
+def _write_profile_config(
+    kanban_home: Path,
+    profile: str,
+    content: str = "{}\n",
+) -> Path:
+    profile_dir = kanban_home / "profiles" / profile
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    config_path = profile_dir / "config.yaml"
+    config_path.write_text(content, encoding="utf-8")
+    return profile_dir
+
+
+def _install_profile_skill(
+    kanban_home: Path,
+    profile: str,
+    identifier: str,
+    *,
+    frontmatter_name: str | None = None,
+    legacy_flat: bool = False,
+) -> Path:
+    profile_dir = _write_profile_config(kanban_home, profile)
+    if legacy_flat:
+        skill_path = profile_dir / "skills" / f"{identifier}.md"
+    else:
+        skill_path = profile_dir / "skills" / identifier / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text(
+        "---\n"
+        f"name: {frontmatter_name or Path(identifier).name}\n"
+        "description: Test skill.\n"
+        "---\n"
+        "\n"
+        "# Test skill\n",
+        encoding="utf-8",
+    )
+    return skill_path
+
+
+def _install_correlated_release(
+    kanban_home: Path,
+    *,
+    profile: str = "data-entry",
+    release: str = "openseason-course-data",
+    version: str = "v1",
+) -> tuple[Path, str]:
+    skill_path = _install_profile_skill(
+        kanban_home,
+        profile,
+        release,
+        frontmatter_name=release,
+    )
+    digest = hashlib.sha256(skill_path.read_bytes()).hexdigest()
+    (skill_path.parent / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": release,
+                "version": version,
+                "profile": profile,
+                "skillDigest": digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return skill_path, digest
+
+
+def _correlated_task_body(
+    *,
+    profile: str = "data-entry",
+    release: str = "openseason-course-data/v1",
+    digest: str,
+) -> str:
+    payload = {
+        "schema": "openseason-course-data-task/v1",
+        "runId": "run-1",
+        "jobId": "job-1",
+        "attempt": 1,
+        "dispatchKey": "course-data:job-1:1",
+        "profile": profile,
+        "profileRelease": release,
+        "skillDigest": digest,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"OPENSEASON_TASK_CONTEXT={encoded}"
+
+
+def test_dispatch_correlated_task_validates_exact_release_before_spawn(kanban_home):
+    _, digest = _install_correlated_release(kanban_home)
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            body=_correlated_task_body(digest=digest),
+            assignee="data-entry",
+            skills=["openseason-course-data"],
+            idempotency_key="course-data:job-1:1",
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id)
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert spawned == [task_id]
+    assert result.preflight_blocked == []
+    assert task is not None and task.status == "running"
+
+
+@pytest.mark.parametrize(
+    ("context_overrides", "expected_field"),
+    [
+        ({"profile": "other-profile"}, "profile"),
+        ({"release": "openseason-course-data/v2"}, "profileRelease"),
+        ({"digest": "0" * 64}, "skillDigest"),
+    ],
+)
+def test_dispatch_correlated_task_blocks_context_or_release_mismatch(
+    kanban_home, context_overrides, expected_field
+):
+    _, digest = _install_correlated_release(kanban_home)
+    body_args = {"digest": digest, **context_overrides}
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            body=_correlated_task_body(**body_args),
+            assignee="data-entry",
+            skills=["openseason-course-data"],
+            idempotency_key="course-data:job-1:1",
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id)
+        )
+        events = kb.list_events(conn, task_id)
+
+    assert spawned == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["code"] == "correlated_skill_fence_mismatch"
+    assert expected_field in events[-1].payload["mismatches"]
+
+
+def test_dispatch_correlated_task_blocks_shadowed_release(kanban_home, tmp_path):
+    _, digest = _install_correlated_release(kanban_home)
+    shadow_root = tmp_path / "shadow"
+    shadow_skill = shadow_root / "openseason-course-data" / "SKILL.md"
+    shadow_skill.parent.mkdir(parents=True)
+    shadow_skill.write_text(
+        "---\nname: openseason-course-data\ndescription: Shadow.\n---\n",
+        encoding="utf-8",
+    )
+    profile_config = (
+        kanban_home / "profiles" / "data-entry" / "config.yaml"
+    )
+    profile_config.write_text(
+        f"skills:\n  external_dirs:\n    - {shadow_root}\n",
+        encoding="utf-8",
+    )
+    spawned: list[str] = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            body=_correlated_task_body(digest=digest),
+            assignee="data-entry",
+            skills=["openseason-course-data"],
+            idempotency_key="course-data:job-1:1",
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, workspace: spawned.append(task.id)
+        )
+
+    assert spawned == []
+    assert result.preflight_blocked == [task_id]
+
+
+@pytest.mark.parametrize("body", [None, "OPENSEASON_TASK_CONTEXT=not+base64"])
+def test_dispatch_correlated_task_fails_closed_without_exact_context(
+    kanban_home, body
+):
+    _install_correlated_release(kanban_home)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            body=body,
+            assignee="data-entry",
+            skills=["openseason-course-data"],
+            idempotency_key="course-data:job-1:1",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        events = kb.list_events(conn, task_id)
+
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["code"] == "correlated_skill_fence_mismatch"
+    assert "OPENSEASON_TASK_CONTEXT" in events[-1].payload["mismatches"]
+
+
+def test_dispatch_blocks_missing_task_skill_before_claim_or_spawn(kanban_home):
+    """A missing forced skill is permanent configuration failure, not a worker run."""
+    _write_profile_config(kanban_home, "data-entry")
+    spawn_calls: list[str] = []
+
+    def capture_spawn(task, workspace):
+        spawn_calls.append(task.id)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert spawn_calls == []
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].kind == "preflight_blocked"
+    assert events[-1].payload["code"] == "missing_task_skills"
+    assert events[-1].payload["profile"] == "data-entry"
+    assert events[-1].payload["missing_skills"] == ["openseason"]
+    assert events[-1].payload["action"]
+
+
+def test_dispatch_accepts_skill_from_assigned_profile_directory(kanban_home):
+    """A task may spawn when its forced skill exists in the profile's own skills tree."""
+    _write_profile_config(kanban_home, "data-entry")
+    skill_dir = (
+        kanban_home / "profiles" / "data-entry" / "skills" / "course" / "openseason"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: openseason\n---\n", encoding="utf-8")
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert spawn_calls == [task_id]
+    assert result.preflight_blocked == []
+    assert task is not None and task.status == "running"
+
+
+def test_dispatch_accepts_skill_from_profile_configured_external_directory(
+    kanban_home, tmp_path
+):
+    """A task may spawn when its skill is in an explicit profile external release path."""
+    profile_dir = kanban_home / "profiles" / "data-entry"
+    profile_dir.mkdir(parents=True)
+    external_skill_dir = tmp_path / "openseason-release" / "openseason"
+    external_skill_dir.mkdir(parents=True)
+    (external_skill_dir / "SKILL.md").write_text(
+        "---\nname: openseason\n---\n",
+        encoding="utf-8",
+    )
+    (profile_dir / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external_skill_dir.parent}\n",
+        encoding="utf-8",
+    )
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert spawn_calls == [task_id]
+    assert result.preflight_blocked == []
+    assert task is not None and task.status == "running"
+
+
+def test_dispatch_blocks_forced_skill_when_profile_config_is_missing(kanban_home):
+    """A local skill cannot make an unconfigured worker profile safe to launch."""
+    profile_dir = kanban_home / "profiles" / "data-entry"
+    skill_dir = profile_dir / "skills" / "openseason"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: openseason\ndescription: Test skill.\n---\n",
+        encoding="utf-8",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: pytest.fail("spawned"))
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert task is not None and task.status == "blocked"
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].kind == "preflight_blocked"
+    assert events[-1].payload["code"] == "profile_config_missing"
+    assert events[-1].payload["profile"] == "data-entry"
+    assert "config.yaml" in events[-1].payload["action"]
+
+
+def test_dispatch_blocks_forced_skill_when_profile_config_is_malformed(kanban_home):
+    """Malformed profile YAML is a permanent preflight error, never a fallback."""
+    _install_profile_skill(kanban_home, "data-entry", "openseason")
+    profile_dir = kanban_home / "profiles" / "data-entry"
+    (profile_dir / "config.yaml").write_text(
+        "skills:\n  external_dirs: [unterminated\n",
+        encoding="utf-8",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: pytest.fail("spawned"))
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert task is not None and task.status == "blocked"
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["code"] == "profile_config_malformed"
+    assert "config.yaml" in events[-1].payload["action"]
+
+
+def test_dispatch_uses_runtime_resolver_for_categorized_skill_identifier(kanban_home):
+    """Preflight accepts the same categorized path that --skills accepts."""
+    _install_profile_skill(
+        kanban_home,
+        "data-entry",
+        "course/openseason",
+        frontmatter_name="openseason",
+    )
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["course/openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id),
+        )
+
+    assert spawn_calls == [task_id]
+    assert result.preflight_blocked == []
+
+
+def test_dispatch_uses_runtime_resolver_for_legacy_flat_skill_identifier(kanban_home):
+    """Preflight retains compatibility with legacy <name>.md skills."""
+    _install_profile_skill(
+        kanban_home,
+        "data-entry",
+        "openseason",
+        legacy_flat=True,
+    )
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id),
+        )
+
+    assert spawn_calls == [task_id]
+    assert result.preflight_blocked == []
+
+
+def test_dispatch_blocks_runtime_skill_name_collision(kanban_home):
+    """Preflight must reject ambiguity exactly as --skills does at startup."""
+    _install_profile_skill(
+        kanban_home,
+        "data-entry",
+        "course/openseason-a",
+        frontmatter_name="openseason",
+    )
+    _install_profile_skill(
+        kanban_home,
+        "data-entry",
+        "research/openseason-b",
+        frontmatter_name="openseason",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: pytest.fail("spawned"))
+        events = kb.list_events(conn, task_id)
+
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["code"] == "unresolved_task_skills"
+    assert events[-1].payload["unresolved_skills"] == ["openseason"]
+    assert "Ambiguous skill name" in events[-1].payload["resolution_errors"][0]["error"]
+
+
+def test_dispatch_missing_skill_dry_run_is_fully_immutable(kanban_home):
+    """Dry-run reports the permanent block without writing task/run/event state."""
+    _write_profile_config(kanban_home, "data-entry")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        events_before = kb.list_events(conn, task_id)
+        result = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            spawn_fn=lambda *_args: pytest.fail("spawned"),
+        )
+        task = kb.get_task(conn, task_id)
+        events_after = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert result.preflight_blocked == [task_id]
+    assert task is not None and task.status == "ready"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert events_after == events_before
+
+
+@pytest.mark.parametrize(
+    "stored_skills",
+    [
+        "",
+        "{not-json",
+        '{"openseason": true}',
+        '[""]',
+        "[123]",
+        "[true]",
+        "[null]",
+        '[{"name": "openseason"}]',
+    ],
+)
+def test_dispatch_blocks_malformed_task_skills_snapshot(
+    kanban_home,
+    stored_skills,
+):
+    """A corrupt forced-skill snapshot cannot silently become a no-skill task."""
+    _write_profile_config(kanban_home, "data-entry")
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (stored_skills, task_id),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawn_calls == []
+    assert task is not None and task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].kind == "preflight_blocked"
+    assert events[-1].payload["code"] == "task_skills_malformed"
+    assert events[-1].payload["profile"] == "data-entry"
+    assert events[-1].payload["action"]
+
+
+def test_dispatch_preflight_rejects_untrusted_leading_slash_like_cli(kanban_home):
+    """A leading slash remains an untrusted absolute path at preflight."""
+    _install_profile_skill(kanban_home, "data-entry", "openseason")
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["/openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawned == []
+    assert task is not None and task.status == "blocked"
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["code"] == "unresolved_task_skills"
+    assert "relative path within the skills directory" in (
+        events[-1].payload["resolution_errors"][0]["error"]
+    )
+
+
+def test_dispatch_preflight_uses_cli_trusted_absolute_skill_normalization(
+    kanban_home,
+):
+    """Preflight accepts a trusted absolute skill path exactly as CLI preload does."""
+    skill_path = _install_profile_skill(
+        kanban_home,
+        "data-entry",
+        "course/openseason",
+    )
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=[str(skill_path.parent)],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    assert spawned == [task_id]
+    assert result.preflight_blocked == []
+
+
+def test_dispatch_claim_revalidates_assignee_after_skill_preflight(
+    kanban_home,
+    monkeypatch,
+):
+    """A reassignment after a passing preflight cannot spawn the new profile."""
+    _install_profile_skill(kanban_home, "profile-a", "openseason")
+    _write_profile_config(kanban_home, "profile-b")
+    from tools import skills_tool
+
+    original_skill_view = skills_tool.skill_view
+    reassigned = False
+    task_id = ""
+
+    def racing_skill_view(*args, **kwargs):
+        nonlocal reassigned
+        result = original_skill_view(*args, **kwargs)
+        if not reassigned:
+            reassigned = True
+            with kb.connect() as other:
+                assert kb.assign_task(other, task_id, "profile-b")
+        return result
+
+    monkeypatch.setattr(skills_tool, "skill_view", racing_skill_view)
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="profile-a",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert reassigned is True
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None and task.status == "ready"
+    assert task.assignee == "profile-b"
+    assert runs == []
+
+
+def test_dispatch_block_revalidates_assignee_after_skill_preflight(
+    kanban_home,
+    monkeypatch,
+):
+    """A task repaired by reassignment cannot be blocked by a stale preflight."""
+    _write_profile_config(kanban_home, "profile-a")
+    _install_profile_skill(kanban_home, "profile-b", "openseason")
+    original_block = kb._block_missing_task_skills
+    reassigned = False
+
+    def racing_block(conn, task_id, **kwargs):
+        nonlocal reassigned
+        if not reassigned:
+            reassigned = True
+            with kb.connect() as other:
+                assert kb.assign_task(other, task_id, "profile-b")
+        return original_block(conn, task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "_block_missing_task_skills", racing_block)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="profile-a",
+            skills=["openseason"],
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: pytest.fail("spawned"))
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert reassigned is True
+    assert result.preflight_blocked == []
+    assert task is not None and task.status == "ready"
+    assert task.assignee == "profile-b"
+    assert [event.kind for event in events].count("preflight_blocked") == 0
+
+
+def test_two_dispatchers_report_only_the_winning_preflight_block(
+    kanban_home,
+    monkeypatch,
+):
+    """Concurrent missing-skill checks produce one block and one truthful result."""
+    _write_profile_config(kanban_home, "data-entry")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Research course data",
+            assignee="data-entry",
+            skills=["openseason"],
+        )
+
+    barrier = threading.Barrier(2)
+    original_block = kb._block_missing_task_skills
+
+    def synchronized_block(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return original_block(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "_block_missing_task_skills", synchronized_block)
+
+    def dispatch():
+        with kb.connect() as conn:
+            return kb.dispatch_once(conn)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: dispatch(), range(2)))
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert task is not None and task.status == "blocked"
+    assert runs == []
+    assert sum(task_id in result.preflight_blocked for result in results) == 1
+    assert [event.kind for event in events].count("preflight_blocked") == 1
+
+
+@pytest.mark.parametrize("skills", [None, []], ids=["sql-null", "json-empty-list"])
+def test_dispatch_task_without_forced_skills_does_not_require_profile_config(
+    kanban_home,
+    skills,
+):
+    """NULL and [] retain the legacy two-argument spawn path."""
+    (kanban_home / "profiles" / "legacy").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy task",
+            assignee="legacy",
+            skills=skills,
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+    assert spawned == [task_id]
+    assert result.preflight_blocked == []
+
 
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:
@@ -3310,6 +4069,7 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
 
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
+    _install_profile_skill(kanban_home, "alice", "sdlc-review")
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
@@ -3321,10 +4081,226 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t).status == "review"
 
 
+def test_dispatch_review_blocks_missing_sdlc_review_before_claim_or_spawn(kanban_home):
+    """Review dispatch validates the skill it actually forces onto the worker."""
+    _write_profile_config(kanban_home, "data-entry")
+    spawn_calls: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review course data",
+            assignee="data-entry",
+        )
+        _set_task_status(conn, task_id, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawn_calls == []
+    assert task is not None and task.status == "blocked"
+    assert task.consecutive_failures == 0
+    assert runs == []
+    assert result.preflight_blocked == [task_id]
+    assert events[-1].payload["missing_skills"] == ["sdlc-review"]
+
+
+def test_dispatch_review_claim_revalidates_assignee_after_skill_preflight(
+    kanban_home,
+    monkeypatch,
+):
+    """Review dispatch cannot spawn a reassigned profile from a stale preflight."""
+    _install_profile_skill(kanban_home, "profile-a", "sdlc-review")
+    _write_profile_config(kanban_home, "profile-b")
+    from tools import skills_tool
+
+    original_skill_view = skills_tool.skill_view
+    reassigned = False
+    task_id = ""
+
+    def racing_skill_view(*args, **kwargs):
+        nonlocal reassigned
+        result = original_skill_view(*args, **kwargs)
+        if not reassigned:
+            reassigned = True
+            with kb.connect() as other:
+                assert kb.assign_task(other, task_id, "profile-b")
+        return result
+
+    monkeypatch.setattr(skills_tool, "skill_view", racing_skill_view)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review course data",
+            assignee="profile-a",
+        )
+        _set_task_status(conn, task_id, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert reassigned is True
+    assert spawned == []
+    assert result.spawned == []
+    assert task is not None and task.status == "review"
+    assert task.assignee == "profile-b"
+    assert runs == []
+
+
+def test_dispatch_review_claim_revalidates_skills_after_skill_preflight(
+    kanban_home,
+    monkeypatch,
+):
+    """Review dispatch cannot claim after the selected task snapshot changes."""
+    _install_profile_skill(kanban_home, "data-entry", "sdlc-review")
+    from tools import skills_tool
+
+    original_skill_view = skills_tool.skill_view
+    changed = False
+    task_id = ""
+
+    def racing_skill_view(*args, **kwargs):
+        nonlocal changed
+        result = original_skill_view(*args, **kwargs)
+        if not changed:
+            changed = True
+            with kb.connect() as other:
+                other.execute(
+                    "UPDATE tasks SET skills = ? WHERE id = ?",
+                    ('["changed-after-preflight"]', task_id),
+                )
+        return result
+
+    monkeypatch.setattr(skills_tool, "skill_view", racing_skill_view)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review course data",
+            assignee="data-entry",
+            skills=["initial-snapshot"],
+        )
+        _set_task_status(conn, task_id, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert changed is True
+    assert spawned == []
+    assert result.spawned == []
+    assert task is not None and task.status == "review"
+    assert task.skills == ["changed-after-preflight"]
+    assert runs == []
+
+
+@pytest.mark.parametrize("mutation", ["assignee", "skills"])
+def test_dispatch_review_block_revalidates_selected_snapshot(
+    kanban_home,
+    monkeypatch,
+    mutation,
+):
+    """A repaired review task cannot be blocked by stale preflight evidence."""
+    _write_profile_config(kanban_home, "profile-a")
+    _install_profile_skill(kanban_home, "profile-b", "sdlc-review")
+    original_block = kb._block_missing_task_skills
+    mutated = False
+
+    def racing_block(conn, task_id, **kwargs):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            with kb.connect() as other:
+                if mutation == "assignee":
+                    assert kb.assign_task(other, task_id, "profile-b")
+                else:
+                    other.execute(
+                        "UPDATE tasks SET skills = ? WHERE id = ?",
+                        ('["repaired-snapshot"]', task_id),
+                    )
+        return original_block(conn, task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "_block_missing_task_skills", racing_block)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review course data",
+            assignee="profile-a",
+            skills=["initial-snapshot"],
+        )
+        _set_task_status(conn, task_id, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args: pytest.fail("spawned"),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert mutated is True
+    assert result.preflight_blocked == []
+    assert task is not None and task.status == "review"
+    assert [event.kind for event in events].count("preflight_blocked") == 0
+
+
+def test_two_review_dispatchers_report_only_the_winning_preflight_block(
+    kanban_home,
+    monkeypatch,
+):
+    """Concurrent review checks produce one block event and one truthful result."""
+    _write_profile_config(kanban_home, "data-entry")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review course data",
+            assignee="data-entry",
+        )
+        _set_task_status(conn, task_id, "review")
+
+    barrier = threading.Barrier(2)
+    original_block = kb._block_missing_task_skills
+
+    def synchronized_block(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return original_block(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "_block_missing_task_skills", synchronized_block)
+
+    def dispatch():
+        with kb.connect() as conn:
+            return kb.dispatch_once(conn)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: dispatch(), range(2)))
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert task is not None and task.status == "blocked"
+    assert runs == []
+    assert sum(task_id in result.preflight_blocked for result in results) == 1
+    assert [event.kind for event in events].count("preflight_blocked") == 1
+
+
 def test_dispatch_review_spawns_with_correct_skills(
     kanban_home, all_assignees_spawnable,
 ):
     """Review tasks get sdlc-review skill set before spawning."""
+    _install_profile_skill(kanban_home, "alice", "sdlc-review")
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -3376,6 +4352,7 @@ def test_dispatch_review_spawns_when_ready_empty(
     kanban_home, all_assignees_spawnable,
 ):
     """When only review tasks exist, they still get dispatched."""
+    _install_profile_skill(kanban_home, "alice", "sdlc-review")
     spawns = []
 
     def fake_spawn(task, workspace, board=None):
