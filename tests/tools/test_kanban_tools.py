@@ -319,10 +319,11 @@ def test_complete_stamps_the_office_envelope_for_a_correlated_worker(monkeypatch
         "office_assignment_id": "assignment-1",
         "office_attempt_id": "assignment-1:attempt:1",
         "employee_id": "course-mapping",
-        "charter_digest": "a" * 64,
+        "charter_digest": "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad",
         "evidence_schema_version": "office-evidence-v1",
     }
     with kb.connect() as conn:
+        monkeypatch.setattr(kb, "_resolve_office_worker_toolsets", lambda tools: ("read_course_queue",))
         receipt = kb.dispatch_office_task(
             conn,
             metadata=metadata,

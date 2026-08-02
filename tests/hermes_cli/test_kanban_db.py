@@ -20,6 +20,9 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+OFFICE_CHARTER_DIGEST = "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad"
+
+
 def test_office_metadata_requires_exact_correlated_envelope():
     metadata = {
         "office_goal_id": "goal-1",
@@ -67,19 +70,20 @@ def test_complete_task_validates_nested_office_metadata_before_mutation(kanban_h
         assert kb.get_task(conn, second_id).status == "running"
 
 
-def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home):
+def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home, monkeypatch):
     metadata = {
         "office_goal_id": "goal-1",
         "office_assignment_id": "assignment-1",
         "office_attempt_id": "assignment-1:attempt:1",
         "employee_id": "course-mapping",
-        "charter_digest": "a" * 64,
+        "charter_digest": OFFICE_CHARTER_DIGEST,
         "evidence_schema_version": "office-evidence-v1",
     }
     spawned = []
+    monkeypatch.setattr(kb, "_resolve_office_worker_toolsets", lambda tools: ("read_course_queue",))
 
-    def spawn(task, workspace, *, office_metadata):
-        spawned.append((task.id, task.assignee, workspace, office_metadata))
+    def spawn(task, workspace, *, office_metadata, office_toolsets):
+        spawned.append((task.id, task.assignee, workspace, office_metadata, office_toolsets))
         return 4321
 
     with kb.connect() as conn:
@@ -114,7 +118,7 @@ def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home
         assert first.task_id == second.task_id
         assert first.spawned is True
         assert second.spawned is False
-        assert spawned == [(first.task_id, "course-mapping", "/Users/macboat/vercel-openseason", metadata)]
+        assert spawned == [(first.task_id, "course-mapping", "/Users/macboat/vercel-openseason", metadata, ("read_course_queue",))]
         assert kb.get_task(conn, first.task_id).status == "running"
         assert kb.get_task(conn, unrelated).status == "ready"
         events = kb.list_events(conn, first.task_id)
@@ -131,6 +135,27 @@ def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home
             kb.dispatch_office_task(conn, metadata=metadata, profile="course-mapping", title="wrong", body="{}", workspace="/tmp/other", authorized_tools=["read_course_queue"], spawn_fn=spawn)
         with pytest.raises(ValueError, match="tool"):
             kb.dispatch_office_task(conn, metadata=metadata, profile="course-mapping", title="wrong", body="{}", workspace="/Users/macboat/vercel-openseason", authorized_tools=["terminal"], spawn_fn=spawn)
+        with pytest.raises(ValueError, match="digest"):
+            kb.dispatch_office_task(conn, metadata={**metadata, "charter_digest": "a" * 64}, profile="course-mapping", title="wrong", body="{}", workspace="/Users/macboat/vercel-openseason", authorized_tools=["read_course_queue"], spawn_fn=spawn)
+
+
+def test_office_dispatch_fails_closed_without_an_exact_worker_tool_surface(kanban_home):
+    metadata = {
+        "office_goal_id": "goal-1",
+        "office_assignment_id": "assignment-1",
+        "office_attempt_id": "assignment-1:tool-fence",
+        "employee_id": "course-mapping",
+        "charter_digest": OFFICE_CHARTER_DIGEST,
+        "evidence_schema_version": "office-evidence-v1",
+    }
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="cannot enforce"):
+            kb.dispatch_office_task(
+                conn, metadata=metadata, profile="course-mapping", title="fenced",
+                body="{}", workspace="/Users/macboat/vercel-openseason",
+                authorized_tools=["read_course_queue"], spawn_fn=lambda *_args, **_kwargs: 1,
+            )
+        assert kb.list_tasks(conn) == []
 
 
 @pytest.fixture
@@ -3429,6 +3454,61 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def test_office_worker_spawn_uses_only_the_exact_authorized_toolset(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                self.pid = 4243
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: ("terminal", "web"))
+        task = kb.Task(
+            id="t_office_toolset", title="x", body=None, assignee="course-mapping",
+            status="running", priority=0, created_by=None, created_at=0,
+            started_at=None, completed_at=None, workspace_kind="dir",
+            workspace_path=str(tmp_path / "ws"), claim_lock=None,
+            claim_expires=None, tenant=None,
+        )
+        kb._default_spawn(
+            task, str(tmp_path / "ws"),
+            office_metadata={
+                "office_goal_id": "goal-1", "office_assignment_id": "assignment-1",
+                "office_attempt_id": "attempt-1", "employee_id": "course-mapping",
+                "charter_digest": OFFICE_CHARTER_DIGEST,
+                "evidence_schema_version": "office-evidence-v1",
+            },
+            office_toolsets=("read_course_queue",),
+        )
+        toolsets_index = captured["cmd"].index("--toolsets")
+        assert captured["cmd"][toolsets_index + 1] == "read_course_queue"
+        assert "terminal,web" not in captured["cmd"]
+
+    def test_office_worker_spawn_cannot_fall_back_to_profile_toolsets(self, tmp_path):
+        task = kb.Task(
+            id="t_office_no_fallback", title="x", body=None, assignee="course-mapping",
+            status="running", priority=0, created_by=None, created_at=0,
+            started_at=None, completed_at=None, workspace_kind="dir",
+            workspace_path=str(tmp_path), claim_lock=None, claim_expires=None,
+            tenant=None,
+        )
+        with pytest.raises(ValueError, match="exact authorized tool surface"):
+            kb._default_spawn(
+                task, str(tmp_path),
+                office_metadata={
+                    "office_goal_id": "goal-1", "office_assignment_id": "assignment-1",
+                    "office_attempt_id": "attempt-1", "employee_id": "course-mapping",
+                    "charter_digest": OFFICE_CHARTER_DIGEST,
+                    "evidence_schema_version": "office-evidence-v1",
+                },
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -137,8 +137,12 @@ _OFFICE_DIGEST_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 # otherwise-valid correlation envelope into arbitrary local command access.
 _OFFICE_EMPLOYEE_CHARTERS = {
     "course-mapping": {
-        "workspaces": frozenset({"/Users/macboat/vercel-openseason"}),
-        "tools": frozenset({"read_course_queue"}),
+        "charters": {
+            "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad": {
+                "workspaces": frozenset({"/Users/macboat/vercel-openseason"}),
+                "tools": frozenset({"read_course_queue"}),
+            },
+        },
     },
 }
 
@@ -171,9 +175,12 @@ def validate_office_metadata(metadata: Any) -> dict[str, str]:
 
 def _validate_office_charter(office: dict[str, str], workspace: str, authorized_tools: Any) -> tuple[str, ...]:
     """Fail closed unless the exact Office employee charter permits launch."""
-    charter = _OFFICE_EMPLOYEE_CHARTERS.get(office["employee_id"])
-    if charter is None:
+    employee = _OFFICE_EMPLOYEE_CHARTERS.get(office["employee_id"])
+    if employee is None:
         raise ValueError("Office dispatch employee has no Hermes charter")
+    charter = employee["charters"].get(office["charter_digest"])
+    if charter is None:
+        raise ValueError("Office dispatch charter digest is not authorized")
     if not isinstance(workspace, str) or not os.path.isabs(workspace):
         raise ValueError("Office dispatch workspace must be an absolute path")
     if workspace not in charter["workspaces"]:
@@ -184,6 +191,21 @@ def _validate_office_charter(office: dict[str, str], workspace: str, authorized_
     if any(not tool or tool not in charter["tools"] for tool in tools):
         raise ValueError("Office dispatch tool is outside the employee charter")
     return tools
+
+
+def _resolve_office_worker_toolsets(authorized_tools: tuple[str, ...]) -> tuple[str, ...]:
+    """Require a one-to-one, singleton toolset for every Office capability.
+
+    A symbolic Office capability is not permission to select a profile's
+    broader toolset.  Hermes currently has no `read_course_queue` singleton,
+    so the live canary deliberately fails closed until such a toolset exists.
+    """
+    from toolsets import resolve_toolset, validate_toolset
+
+    for tool in authorized_tools:
+        if not validate_toolset(tool) or tuple(resolve_toolset(tool)) != (tool,):
+            raise ValueError(f"Office dispatch cannot enforce exact tool surface for {tool}")
+    return authorized_tools
 
 
 @dataclass(frozen=True)
@@ -2454,6 +2476,7 @@ def dispatch_office_task(
     if canonical_profile != office["employee_id"]:
         raise ValueError("Office dispatch profile must match employee_id")
     tools = _validate_office_charter(office, workspace, authorized_tools)
+    office_toolsets = _resolve_office_worker_toolsets(tools)
     task_id = create_task(
         conn,
         title=title,
@@ -2494,9 +2517,15 @@ def dispatch_office_task(
     set_workspace_path(conn, claimed.id, str(resolved))
     try:
         if spawn_fn is None:
-            pid = _default_spawn(claimed, str(resolved), board=board, office_metadata=office)
+            pid = _default_spawn(
+                claimed, str(resolved), board=board, office_metadata=office,
+                office_toolsets=office_toolsets,
+            )
         else:
-            pid = spawn_fn(claimed, str(resolved), office_metadata=office)
+            pid = spawn_fn(
+                claimed, str(resolved), office_metadata=office,
+                office_toolsets=office_toolsets,
+            )
     except Exception as exc:
         _record_spawn_failure(conn, claimed.id, str(exc))
         raise
@@ -7408,6 +7437,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     office_metadata: Optional[dict[str, str]] = None,
+    office_toolsets: Optional[tuple[str, ...]] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -7422,6 +7452,8 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
+    if office_metadata is not None and office_toolsets is None:
+        raise ValueError("Office worker spawn requires an exact authorized tool surface")
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -7542,7 +7574,10 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    # An Office task uses only its exact, already-validated singleton
+    # toolsets.  It must never fall back to the assigned profile's wider
+    # configured surface. Ordinary Kanban workers retain their profile policy.
+    worker_toolsets = office_toolsets if office_toolsets is not None else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

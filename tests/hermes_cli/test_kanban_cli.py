@@ -73,6 +73,18 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
         kc._parse_branch_flag("bad branch")
 
 
+def test_office_dispatch_parser_rejects_unsupported_office_flags():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    kc.build_parser(subparsers)
+    with pytest.raises(SystemExit) as rejected:
+        parser.parse_args([
+            "kanban", "office-dispatch", "--workspace", "/tmp/work",
+            "--title", "Office assignment", "--office-goal-id", "forged",
+        ])
+    assert rejected.value.code == 2
+
+
 # ---------------------------------------------------------------------------
 # run_slash smoke tests (end-to-end via the same entry both CLI and gateway use)
 # ---------------------------------------------------------------------------
