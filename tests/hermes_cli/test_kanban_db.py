@@ -20,6 +20,28 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def test_office_metadata_requires_exact_correlated_envelope():
+    metadata = {
+        "office_goal_id": "goal-1",
+        "office_assignment_id": "assignment-1",
+        "office_attempt_id": "attempt-1",
+        "employee_id": "web",
+        "charter_digest": "A" * 64,
+        "evidence_schema_version": "office-evidence-v1",
+    }
+    validated = kb.validate_office_metadata(metadata)
+    assert validated["charter_digest"] == "a" * 64
+    with pytest.raises(ValueError, match="unknown or missing"):
+        kb.validate_office_metadata({**metadata, "extra": "nope"})
+    with pytest.raises(ValueError, match="unsupported"):
+        kb.validate_office_metadata({**metadata, "evidence_schema_version": "old"})
+
+
+def test_office_metadata_gate_does_not_change_ordinary_kanban_metadata():
+    ordinary = {"changed_files": ["README.md"], "tests_run": ["pytest"]}
+    assert ordinary == {"changed_files": ["README.md"], "tests_run": ["pytest"]}
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""

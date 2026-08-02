@@ -123,6 +123,42 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # effect of normal API traffic.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 
+# Office control-plane correlation is deliberately a small, exact envelope.
+# Hermes Kanban stores it on runs/events but does not own Office state.
+OFFICE_EVIDENCE_SCHEMA_VERSION = "office-evidence-v1"
+_OFFICE_METADATA_KEYS = frozenset({
+    "office_goal_id", "office_assignment_id", "office_attempt_id",
+    "employee_id", "charter_digest", "evidence_schema_version",
+})
+_OFFICE_ID_RE = re.compile(r"^[^\s]{1,128}$")
+_OFFICE_DIGEST_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+
+
+def validate_office_metadata(metadata: Any) -> dict[str, str]:
+    """Validate and copy the exact Office correlation envelope.
+
+    This is intentionally only a metadata gate. The Office host remains the
+    authority for assignments, attempts, leases, and terminal transitions.
+    """
+    if not isinstance(metadata, dict):
+        raise ValueError("Office metadata must be an object")
+    if set(metadata) != set(_OFFICE_METADATA_KEYS):
+        raise ValueError("Office metadata contains unknown or missing fields")
+    result: dict[str, str] = {}
+    for key in ("office_goal_id", "office_assignment_id", "office_attempt_id", "employee_id"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not _OFFICE_ID_RE.fullmatch(value):
+            raise ValueError(f"Office metadata {key} is invalid")
+        result[key] = value
+    digest = metadata.get("charter_digest")
+    if not isinstance(digest, str) or not _OFFICE_DIGEST_RE.fullmatch(digest):
+        raise ValueError("Office metadata charter_digest is invalid")
+    result["charter_digest"] = digest.lower()
+    if metadata.get("evidence_schema_version") != OFFICE_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("Office metadata evidence schema version is unsupported")
+    result["evidence_schema_version"] = OFFICE_EVIDENCE_SCHEMA_VERSION
+    return result
+
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Return the effective claim TTL, honoring the kanban env override.
@@ -3634,6 +3670,13 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # If this is an Office-correlated run, enforce the exact envelope before
+    # any task state mutation. Ordinary Kanban metadata remains unchanged.
+    if isinstance(metadata, dict) and any(key in metadata for key in _OFFICE_METADATA_KEYS):
+        metadata = dict(metadata)
+        office = metadata.get("office_metadata", metadata)
+        validate_office_metadata(office)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
