@@ -132,6 +132,15 @@ _OFFICE_METADATA_KEYS = frozenset({
 })
 _OFFICE_ID_RE = re.compile(r"^[^\s]{1,128}$")
 _OFFICE_DIGEST_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# The live Office bridge presently authorizes only the course-mapping canary.
+# Keep this policy explicit on the Hermes side so a caller cannot turn an
+# otherwise-valid correlation envelope into arbitrary local command access.
+_OFFICE_EMPLOYEE_CHARTERS = {
+    "course-mapping": {
+        "workspaces": frozenset({"/Users/macboat/vercel-openseason"}),
+        "tools": frozenset({"read_course_queue"}),
+    },
+}
 
 
 def validate_office_metadata(metadata: Any) -> dict[str, str]:
@@ -158,6 +167,23 @@ def validate_office_metadata(metadata: Any) -> dict[str, str]:
         raise ValueError("Office metadata evidence schema version is unsupported")
     result["evidence_schema_version"] = OFFICE_EVIDENCE_SCHEMA_VERSION
     return result
+
+
+def _validate_office_charter(office: dict[str, str], workspace: str, authorized_tools: Any) -> tuple[str, ...]:
+    """Fail closed unless the exact Office employee charter permits launch."""
+    charter = _OFFICE_EMPLOYEE_CHARTERS.get(office["employee_id"])
+    if charter is None:
+        raise ValueError("Office dispatch employee has no Hermes charter")
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):
+        raise ValueError("Office dispatch workspace must be an absolute path")
+    if workspace not in charter["workspaces"]:
+        raise ValueError("Office dispatch workspace is outside the employee charter")
+    if not isinstance(authorized_tools, (list, tuple)) or not authorized_tools:
+        raise ValueError("Office dispatch authorized tools are required")
+    tools = tuple(str(tool) for tool in authorized_tools)
+    if any(not tool or tool not in charter["tools"] for tool in tools):
+        raise ValueError("Office dispatch tool is outside the employee charter")
+    return tools
 
 
 @dataclass(frozen=True)
@@ -2413,6 +2439,7 @@ def dispatch_office_task(
     title: str,
     body: Optional[str],
     workspace: str,
+    authorized_tools: Any,
     spawn_fn=None,
     board: Optional[str] = None,
 ) -> OfficeDispatchResult:
@@ -2426,8 +2453,7 @@ def dispatch_office_task(
     canonical_profile = _canonical_assignee(profile)
     if canonical_profile != office["employee_id"]:
         raise ValueError("Office dispatch profile must match employee_id")
-    if not isinstance(workspace, str) or not os.path.isabs(workspace):
-        raise ValueError("Office dispatch workspace must be an absolute path")
+    tools = _validate_office_charter(office, workspace, authorized_tools)
     task_id = create_task(
         conn,
         title=title,
@@ -2437,20 +2463,23 @@ def dispatch_office_task(
         workspace_kind="dir",
         workspace_path=workspace,
         idempotency_key=f"office:{office['office_attempt_id']}",
+        initial_status="blocked",
         board=board,
     )
     _bind_office_task(conn, task_id, office)
+    with write_txn(conn):
+        _append_event(conn, task_id, "office_charter_authorized", {"authorized_tools": list(tools)})
     task = get_task(conn, task_id)
     if task is None:
         raise RuntimeError(f"Office task {task_id} disappeared after creation")
-    if task.status != "ready":
+    if task.status == "running":
         return OfficeDispatchResult(
             task_id=task.id,
             spawned=False,
             status=task.status,
             worker_pid=task.worker_pid,
         )
-    claimed = claim_task(conn, task.id)
+    claimed = claim_task(conn, task.id, office_metadata=office)
     if claimed is None:
         current = get_task(conn, task.id)
         if current is None:
@@ -3150,8 +3179,10 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
     preflight_fence: Optional[tuple[Optional[str], ...]] = None,
+    office_metadata: Optional[dict[str, str]] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``ready -> running`` (or a correlated Office
+    card's private ``blocked -> running`` transition).
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
@@ -3160,6 +3191,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        expected_status = "ready"
+        if office_metadata is not None:
+            office = validate_office_metadata(office_metadata)
+            if _office_task_metadata(conn, task_id) != office:
+                raise ValueError("Office claim metadata does not match task correlation")
+            expected_status = "blocked"
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3177,8 +3214,8 @@ def claim_task(
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
-                (task_id,),
+                "WHERE id = ? AND status = ?",
+                (task_id, expected_status),
             )
             _append_event(
                 conn, task_id, "claim_rejected",
@@ -3190,8 +3227,8 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = ?",
+            (task_id, expected_status),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -3226,11 +3263,11 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status = ?
                AND claim_lock IS NULL
                {fence_sql}
             """,
-            (lock, expires, now, task_id, *fence_params),
+            (lock, expires, now, task_id, expected_status, *fence_params),
         )
         if cur.rowcount != 1:
             return None

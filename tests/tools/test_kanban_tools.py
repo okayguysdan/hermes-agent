@@ -318,7 +318,7 @@ def test_complete_stamps_the_office_envelope_for_a_correlated_worker(monkeypatch
         "office_goal_id": "goal-1",
         "office_assignment_id": "assignment-1",
         "office_attempt_id": "assignment-1:attempt:1",
-        "employee_id": "web",
+        "employee_id": "course-mapping",
         "charter_digest": "a" * 64,
         "evidence_schema_version": "office-evidence-v1",
     }
@@ -326,14 +326,15 @@ def test_complete_stamps_the_office_envelope_for_a_correlated_worker(monkeypatch
         receipt = kb.dispatch_office_task(
             conn,
             metadata=metadata,
-            profile="web",
+            profile="course-mapping",
             title="Office assignment assignment-1",
             body="{}",
-            workspace=str(tmp_path / "office-work"),
+            workspace="/Users/macboat/vercel-openseason",
+            authorized_tools=["read_course_queue"],
             spawn_fn=lambda *_args, **_kwargs: 4321,
         )
     monkeypatch.setenv("HERMES_KANBAN_TASK", receipt.task_id)
-    monkeypatch.setenv("HERMES_PROFILE", "web")
+    monkeypatch.setenv("HERMES_PROFILE", "course-mapping")
     monkeypatch.setenv("HERMES_OFFICE_METADATA", json.dumps(metadata))
 
     from tools import kanban_tools as kt

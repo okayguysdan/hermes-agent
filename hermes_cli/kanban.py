@@ -644,6 +644,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_office_dispatch.add_argument("--workspace", required=True)
     p_office_dispatch.add_argument("--title", required=True)
     p_office_dispatch.add_argument("--body", default=None)
+    p_office_dispatch.add_argument("--authorized-tool", action="append", default=[])
     p_office_dispatch.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -2233,6 +2234,7 @@ def _cmd_office_dispatch(args: argparse.Namespace) -> int:
                 title=args.title,
                 body=args.body,
                 workspace=args.workspace,
+                authorized_tools=args.authorized_tool,
             )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         print(f"kanban office-dispatch: {exc}", file=sys.stderr)

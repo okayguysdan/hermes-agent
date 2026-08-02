@@ -72,7 +72,7 @@ def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home
         "office_goal_id": "goal-1",
         "office_assignment_id": "assignment-1",
         "office_attempt_id": "assignment-1:attempt:1",
-        "employee_id": "web",
+        "employee_id": "course-mapping",
         "charter_digest": "a" * 64,
         "evidence_schema_version": "office-evidence-v1",
     }
@@ -93,30 +93,44 @@ def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home
         first = kb.dispatch_office_task(
             conn,
             metadata=metadata,
-            profile="web",
+            profile="course-mapping",
             title="Office assignment assignment-1",
             body="{}",
-            workspace="/tmp/office-work",
+            workspace="/Users/macboat/vercel-openseason",
+            authorized_tools=["read_course_queue"],
             spawn_fn=spawn,
         )
         second = kb.dispatch_office_task(
             conn,
             metadata=metadata,
-            profile="web",
+            profile="course-mapping",
             title="Office assignment assignment-1",
             body="{}",
-            workspace="/tmp/office-work",
+            workspace="/Users/macboat/vercel-openseason",
+            authorized_tools=["read_course_queue"],
             spawn_fn=spawn,
         )
 
         assert first.task_id == second.task_id
         assert first.spawned is True
         assert second.spawned is False
-        assert spawned == [(first.task_id, "web", "/tmp/office-work", metadata)]
+        assert spawned == [(first.task_id, "course-mapping", "/Users/macboat/vercel-openseason", metadata)]
         assert kb.get_task(conn, first.task_id).status == "running"
         assert kb.get_task(conn, unrelated).status == "ready"
         events = kb.list_events(conn, first.task_id)
         assert any(event.kind == "office_correlated" and event.payload == {"office_metadata": metadata} for event in events)
+        with pytest.raises(ValueError, match="requires metadata"):
+            kb.complete_task(conn, first.task_id, expected_run_id=kb.get_task(conn, first.task_id).current_run_id)
+        with pytest.raises(ValueError, match="does not match"):
+            kb.complete_task(conn, first.task_id, metadata={"office_metadata": {**metadata, "office_attempt_id": "wrong"}}, expected_run_id=kb.get_task(conn, first.task_id).current_run_id)
+        with pytest.raises(ValueError, match="profile"):
+            kb.dispatch_office_task(conn, metadata=metadata, profile="other-profile", title="wrong", body="{}", workspace="/Users/macboat/vercel-openseason", authorized_tools=["read_course_queue"], spawn_fn=spawn)
+        with pytest.raises(ValueError, match="absolute"):
+            kb.dispatch_office_task(conn, metadata=metadata, profile="course-mapping", title="wrong", body="{}", workspace="relative", authorized_tools=["read_course_queue"], spawn_fn=spawn)
+        with pytest.raises(ValueError, match="charter"):
+            kb.dispatch_office_task(conn, metadata=metadata, profile="course-mapping", title="wrong", body="{}", workspace="/tmp/other", authorized_tools=["read_course_queue"], spawn_fn=spawn)
+        with pytest.raises(ValueError, match="tool"):
+            kb.dispatch_office_task(conn, metadata=metadata, profile="course-mapping", title="wrong", body="{}", workspace="/Users/macboat/vercel-openseason", authorized_tools=["terminal"], spawn_fn=spawn)
 
 
 @pytest.fixture
