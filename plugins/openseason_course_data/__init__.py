@@ -313,7 +313,7 @@ class CourseDataBridge:
             or value.get("dispatchKey") != expected_key
             or _task_field(task, "idempotency_key") != expected_key
             or value.get("profile") != "data-entry"
-            or value.get("profileRelease") != "openseason-course-data/v1"
+            or value.get("profileRelease") != "openseason-course-data/v2"
             or not isinstance(value.get("skillDigest"), str)
             or len(value["skillDigest"]) != 64
         ):
@@ -447,6 +447,15 @@ class CourseDataBridge:
         )
         return _public_result(result)
 
+    def digest_excerpt(self, excerpt: str) -> Dict[str, str]:
+        """Hash the exact evidence excerpt without exposing general code execution."""
+        self._assigned()
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            raise BridgeError("Source excerpt must be a non-empty string")
+        if len(excerpt) > 2_000:
+            raise BridgeError("Source excerpt must be at most 2000 characters")
+        return {"contentSha256": _sha256(excerpt)}
+
     @staticmethod
     def _agent_fence(assigned: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -554,6 +563,21 @@ def register(ctx: Any) -> None:
             "Fetch the immutable OpenSeason context for this assigned course-data run.",
             {"type": "object", "properties": {}, "additionalProperties": False},
             lambda args, **kwargs: _tool_result(bridge.context),
+        ),
+        (
+            "openseason_course_digest",
+            "Compute SHA-256 for the exact public-source excerpt used as evidence.",
+            {
+                "type": "object",
+                "properties": {
+                    "excerpt": {"type": "string", "minLength": 1, "maxLength": 2000}
+                },
+                "required": ["excerpt"],
+                "additionalProperties": False,
+            },
+            lambda args, **kwargs: _tool_result(
+                lambda: bridge.digest_excerpt(args.get("excerpt", ""))
+            ),
         ),
         (
             "openseason_course_heartbeat",

@@ -42,7 +42,7 @@ def encoded_context(**overrides):
         "attempt": 1,
         "dispatchKey": "course-data:job-1:1",
         "profile": "data-entry",
-        "profileRelease": "openseason-course-data/v1",
+        "profileRelease": "openseason-course-data/v2",
         "skillDigest": DIGEST,
         **overrides,
     }
@@ -97,7 +97,7 @@ def upstream_context():
             "attempt": 1,
             "hermesTaskId": "task-1",
             "profile": "data-entry",
-            "profileRelease": "openseason-course-data/v1",
+            "profileRelease": "openseason-course-data/v2",
             "skillDigest": DIGEST,
             "state": "preflight",
         },
@@ -195,6 +195,7 @@ def test_plugin_registers_only_assigned_run_tools_without_run_selectors():
     plugin.register(Context())
     assert {entry["name"] for entry in registered} == {
         "openseason_course_context",
+        "openseason_course_digest",
         "openseason_course_heartbeat",
         "openseason_course_submit",
         "openseason_course_fail",
@@ -205,6 +206,26 @@ def test_plugin_registers_only_assigned_run_tools_without_run_selectors():
         assert "runId" not in properties
         assert "hermesTaskId" not in properties
         assert "leaseToken" not in properties
+
+
+def test_digest_hashes_the_exact_source_excerpt_without_credentials_or_http(monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    monkeypatch.setenv("HERMES_PROFILE", "data-entry")
+
+    class ExplodingKeychain:
+        def signing_credentials(self):
+            raise AssertionError("credentials must not be read")
+
+    bridge = plugin.CourseDataBridge(
+        task_resolver=lambda _: task(),
+        keychain=ExplodingKeychain(),
+        request=lambda **_: pytest.fail("HTTP must not run"),
+    )
+    excerpt = "Fox Hollow Golf Club in American Fork, Utah."
+    assert bridge.digest_excerpt(excerpt) == {
+        "contentSha256": hashlib.sha256(excerpt.encode()).hexdigest(),
+    }
 
 
 def test_context_rejects_non_worker_or_wrong_profile_before_keychain_or_http(monkeypatch):
@@ -368,7 +389,7 @@ def test_submit_injects_immutable_context_and_full_agent_fence(monkeypatch):
         "attempt": 1,
         "hermesTaskId": "task-1",
         "profile": "data-entry",
-        "profileRelease": "openseason-course-data/v1",
+            "profileRelease": "openseason-course-data/v2",
         "skillDigest": DIGEST,
     }
     canonical = json.dumps(
