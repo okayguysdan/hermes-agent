@@ -67,6 +67,58 @@ def test_complete_task_validates_nested_office_metadata_before_mutation(kanban_h
         assert kb.get_task(conn, second_id).status == "running"
 
 
+def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home):
+    metadata = {
+        "office_goal_id": "goal-1",
+        "office_assignment_id": "assignment-1",
+        "office_attempt_id": "assignment-1:attempt:1",
+        "employee_id": "web",
+        "charter_digest": "a" * 64,
+        "evidence_schema_version": "office-evidence-v1",
+    }
+    spawned = []
+
+    def spawn(task, workspace, *, office_metadata):
+        spawned.append((task.id, task.assignee, workspace, office_metadata))
+        return 4321
+
+    with kb.connect() as conn:
+        unrelated = kb.create_task(
+            conn,
+            title="Unrelated ready card",
+            assignee="other-profile",
+            workspace_kind="dir",
+            workspace_path="/tmp/unrelated",
+        )
+        first = kb.dispatch_office_task(
+            conn,
+            metadata=metadata,
+            profile="web",
+            title="Office assignment assignment-1",
+            body="{}",
+            workspace="/tmp/office-work",
+            spawn_fn=spawn,
+        )
+        second = kb.dispatch_office_task(
+            conn,
+            metadata=metadata,
+            profile="web",
+            title="Office assignment assignment-1",
+            body="{}",
+            workspace="/tmp/office-work",
+            spawn_fn=spawn,
+        )
+
+        assert first.task_id == second.task_id
+        assert first.spawned is True
+        assert second.spawned is False
+        assert spawned == [(first.task_id, "web", "/tmp/office-work", metadata)]
+        assert kb.get_task(conn, first.task_id).status == "running"
+        assert kb.get_task(conn, unrelated).status == "ready"
+        events = kb.list_events(conn, first.task_id)
+        assert any(event.kind == "office_correlated" and event.payload == {"office_metadata": metadata} for event in events)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""

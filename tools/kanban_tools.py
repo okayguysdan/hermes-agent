@@ -129,6 +129,24 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _stamp_office_completion_metadata(metadata: Optional[dict]) -> Optional[dict]:
+    """Carry the dispatcher-provided Office fence into worker completion."""
+    raw = os.environ.get("HERMES_OFFICE_METADATA")
+    if not raw:
+        return metadata
+    from hermes_cli import kanban_db as kb
+    try:
+        office = kb.validate_office_metadata(json.loads(raw))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("HERMES_OFFICE_METADATA is invalid") from exc
+    stamped = dict(metadata or {})
+    supplied = stamped.get("office_metadata")
+    if supplied is not None and kb.validate_office_metadata(supplied) != office:
+        raise ValueError("completion Office metadata does not match worker correlation")
+    stamped["office_metadata"] = office
+    return stamped
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -548,6 +566,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    metadata = _stamp_office_completion_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:

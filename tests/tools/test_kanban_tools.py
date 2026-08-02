@@ -311,6 +311,42 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_stamps_the_office_envelope_for_a_correlated_worker(monkeypatch, tmp_path, worker_env):
+    """A worker cannot accidentally complete an Office card without its fence."""
+    from hermes_cli import kanban_db as kb
+    metadata = {
+        "office_goal_id": "goal-1",
+        "office_assignment_id": "assignment-1",
+        "office_attempt_id": "assignment-1:attempt:1",
+        "employee_id": "web",
+        "charter_digest": "a" * 64,
+        "evidence_schema_version": "office-evidence-v1",
+    }
+    with kb.connect() as conn:
+        receipt = kb.dispatch_office_task(
+            conn,
+            metadata=metadata,
+            profile="web",
+            title="Office assignment assignment-1",
+            body="{}",
+            workspace=str(tmp_path / "office-work"),
+            spawn_fn=lambda *_args, **_kwargs: 4321,
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", receipt.task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "web")
+    monkeypatch.setenv("HERMES_OFFICE_METADATA", json.dumps(metadata))
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "completed Office work", "metadata": {"files": 2}})
+
+    assert json.loads(out)["ok"] is True
+    with kb.connect() as conn:
+        assert kb.latest_run(conn, receipt.task_id).metadata == {
+            "files": 2,
+            "office_metadata": metadata,
+        }
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt

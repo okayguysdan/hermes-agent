@@ -633,6 +633,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    # --- office-dispatch ---
+    # The full correlation envelope stays in HERMES_OFFICE_METADATA rather
+    # than becoming a set of broad public dispatch flags.  This command never
+    # scans or launches unrelated ready cards.
+    p_office_dispatch = sub.add_parser(
+        "office-dispatch",
+        help=argparse.SUPPRESS,
+    )
+    p_office_dispatch.add_argument("--workspace", required=True)
+    p_office_dispatch.add_argument("--title", required=True)
+    p_office_dispatch.add_argument("--body", default=None)
+    p_office_dispatch.add_argument("--json", action="store_true")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -945,6 +958,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
+            "office-dispatch": _cmd_office_dispatch,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
@@ -2203,6 +2217,36 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    return 0
+
+
+def _cmd_office_dispatch(args: argparse.Namespace) -> int:
+    """Launch only the Office assignment carried in the trusted child env."""
+    raw = os.environ.get("HERMES_OFFICE_METADATA", "")
+    try:
+        metadata = json.loads(raw)
+        with kb.connect_closing() as conn:
+            result = kb.dispatch_office_task(
+                conn,
+                metadata=metadata,
+                profile=_profile_author() or "",
+                title=args.title,
+                body=args.body,
+                workspace=args.workspace,
+            )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"kanban office-dispatch: {exc}", file=sys.stderr)
+        return 2
+    payload = {
+        "task_id": result.task_id,
+        "spawned": result.spawned,
+        "status": result.status,
+        "worker_pid": result.worker_pid,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(f"Office task {result.task_id}: status={result.status}, spawned={result.spawned}")
     return 0
 
 

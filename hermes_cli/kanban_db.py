@@ -160,6 +160,21 @@ def validate_office_metadata(metadata: Any) -> dict[str, str]:
     return result
 
 
+@dataclass(frozen=True)
+class OfficeDispatchResult:
+    """The narrow Kanban receipt for one Office-owned assignment.
+
+    Hermes returns only this execution receipt.  It never translates the
+    task's lifecycle into an Office assignment transition; that remains the
+    Office control store's responsibility.
+    """
+
+    task_id: str
+    spawned: bool
+    status: str
+    worker_pid: Optional[int] = None
+
+
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     """Return the effective claim TTL, honoring the kanban env override.
 
@@ -2357,6 +2372,115 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def _office_task_metadata(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, str]]:
+    """Return the one validated Office envelope bound to a Kanban card."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'office_correlated' ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    bound: Optional[dict[str, str]] = None
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+            current = validate_office_metadata(payload.get("office_metadata"))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Office correlation for task {task_id} is invalid") from exc
+        if bound is not None and current != bound:
+            raise ValueError(f"Office correlation for task {task_id} conflicts")
+        bound = current
+    return bound
+
+
+def _bind_office_task(
+    conn: sqlite3.Connection, task_id: str, metadata: dict[str, str]
+) -> dict[str, str]:
+    """Attach the immutable Office envelope, rejecting correlation drift."""
+    with write_txn(conn):
+        current = _office_task_metadata(conn, task_id)
+        if current is None:
+            _append_event(conn, task_id, "office_correlated", {"office_metadata": metadata})
+            return metadata
+        if current != metadata:
+            raise ValueError(f"Office correlation for task {task_id} does not match")
+        return current
+
+
+def dispatch_office_task(
+    conn: sqlite3.Connection,
+    *,
+    metadata: Any,
+    profile: str,
+    title: str,
+    body: Optional[str],
+    workspace: str,
+    spawn_fn=None,
+    board: Optional[str] = None,
+) -> OfficeDispatchResult:
+    """Idempotently create and launch exactly one Office-correlated card.
+
+    This is intentionally separate from :func:`dispatch_once`: a normal
+    dispatcher pass may select any ready card, while an Office lease may only
+    launch the assignment identified by its full correlation envelope.
+    """
+    office = validate_office_metadata(metadata)
+    canonical_profile = _canonical_assignee(profile)
+    if canonical_profile != office["employee_id"]:
+        raise ValueError("Office dispatch profile must match employee_id")
+    if not isinstance(workspace, str) or not os.path.isabs(workspace):
+        raise ValueError("Office dispatch workspace must be an absolute path")
+    task_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=canonical_profile,
+        created_by="office-dispatcher",
+        workspace_kind="dir",
+        workspace_path=workspace,
+        idempotency_key=f"office:{office['office_attempt_id']}",
+        board=board,
+    )
+    _bind_office_task(conn, task_id, office)
+    task = get_task(conn, task_id)
+    if task is None:
+        raise RuntimeError(f"Office task {task_id} disappeared after creation")
+    if task.status != "ready":
+        return OfficeDispatchResult(
+            task_id=task.id,
+            spawned=False,
+            status=task.status,
+            worker_pid=task.worker_pid,
+        )
+    claimed = claim_task(conn, task.id)
+    if claimed is None:
+        current = get_task(conn, task.id)
+        if current is None:
+            raise RuntimeError(f"Office task {task.id} disappeared during claim")
+        return OfficeDispatchResult(
+            task_id=current.id,
+            spawned=False,
+            status=current.status,
+            worker_pid=current.worker_pid,
+        )
+    resolved = resolve_workspace(claimed, board=board)
+    set_workspace_path(conn, claimed.id, str(resolved))
+    try:
+        if spawn_fn is None:
+            pid = _default_spawn(claimed, str(resolved), board=board, office_metadata=office)
+        else:
+            pid = spawn_fn(claimed, str(resolved), office_metadata=office)
+    except Exception as exc:
+        _record_spawn_failure(conn, claimed.id, str(exc))
+        raise
+    if pid:
+        _set_worker_pid(conn, claimed.id, int(pid))
+    return OfficeDispatchResult(
+        task_id=claimed.id,
+        spawned=True,
+        status="running",
+        worker_pid=int(pid) if pid else None,
+    )
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -3671,13 +3795,22 @@ def complete_task(
     """
     now = int(time.time())
 
-    # If this is an Office-correlated run, enforce the exact envelope before
-    # any task state mutation. Ordinary Kanban metadata remains unchanged.
-    if isinstance(metadata, dict) and (
+    # If this card was launched by Office, its task-bound envelope is a
+    # completion fence: omit or alter it and the task stays running.  Hermes
+    # validates the correlation but does not infer an Office state transition.
+    expected_office = _office_task_metadata(conn, task_id)
+    if expected_office is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError("Office-correlated completion requires metadata")
+        office = metadata.get("office_metadata", metadata)
+        if validate_office_metadata(office) != expected_office:
+            raise ValueError("Office completion metadata does not match task correlation")
+    # A normal Kanban card may voluntarily carry Office metadata; validate it
+    # without changing ordinary metadata semantics.
+    elif isinstance(metadata, dict) and (
         "office_metadata" in metadata
         or any(key in metadata for key in _OFFICE_METADATA_KEYS)
     ):
-        metadata = dict(metadata)
         office = metadata.get("office_metadata", metadata)
         validate_office_metadata(office)
 
@@ -7237,6 +7370,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    office_metadata: Optional[dict[str, str]] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -7260,6 +7394,12 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    if office_metadata is not None:
+        env["HERMES_OFFICE_METADATA"] = json.dumps(
+            validate_office_metadata(office_metadata),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
