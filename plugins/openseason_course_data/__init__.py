@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Optional
 
 
 WORKER_VERSION = "3.0.0"
-BASE_URL = "https://openseason.golf"
+BASE_URL = "https://www.openseason.golf"
 SIGNING_SERVICE = "com.openseason.course-data.worker"
 LEASE_SERVICE = "com.openseason.course-data.lease"
 TOOLSET = "openseason-course-data"

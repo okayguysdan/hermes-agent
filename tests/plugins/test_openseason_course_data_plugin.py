@@ -29,6 +29,11 @@ def load_plugin():
     return module
 
 
+def test_production_requests_use_the_canonical_non_redirecting_origin():
+    plugin = load_plugin()
+    assert plugin.BASE_URL == "https://www.openseason.golf"
+
+
 def encoded_context(**overrides):
     value = {
         "schema": "openseason-course-data-task/v1",
