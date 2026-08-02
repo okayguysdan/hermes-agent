@@ -3673,7 +3673,10 @@ def complete_task(
 
     # If this is an Office-correlated run, enforce the exact envelope before
     # any task state mutation. Ordinary Kanban metadata remains unchanged.
-    if isinstance(metadata, dict) and any(key in metadata for key in _OFFICE_METADATA_KEYS):
+    if isinstance(metadata, dict) and (
+        "office_metadata" in metadata
+        or any(key in metadata for key in _OFFICE_METADATA_KEYS)
+    ):
         metadata = dict(metadata)
         office = metadata.get("office_metadata", metadata)
         validate_office_metadata(office)

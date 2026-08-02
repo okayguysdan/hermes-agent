@@ -42,6 +42,31 @@ def test_office_metadata_gate_does_not_change_ordinary_kanban_metadata():
     assert ordinary == {"changed_files": ["README.md"], "tests_run": ["pytest"]}
 
 
+def test_complete_task_validates_nested_office_metadata_before_mutation(kanban_home):
+    metadata = {
+        "office_goal_id": "goal-1",
+        "office_assignment_id": "assignment-1",
+        "office_attempt_id": "attempt-1",
+        "employee_id": "web",
+        "charter_digest": "a" * 64,
+        "evidence_schema_version": "office-evidence-v1",
+    }
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Nested Office completion")
+        claimed = kb.claim_task(conn, task_id, claimer="test-dispatcher")
+        assert claimed is not None
+        assert kb.complete_task(conn, task_id, metadata={"office_metadata": metadata}, expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, task_id).status == "done"
+
+        second_id = kb.create_task(conn, title="Malformed nested Office completion")
+        second_claim = kb.claim_task(conn, second_id, claimer="test-dispatcher-2")
+        assert second_claim is not None
+        malformed = {"office_metadata": {**metadata, "employee_id": ""}}
+        with pytest.raises(ValueError, match="Office metadata employee_id"):
+            kb.complete_task(conn, second_id, metadata=malformed, expected_run_id=second_claim.current_run_id)
+        assert kb.get_task(conn, second_id).status == "running"
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
