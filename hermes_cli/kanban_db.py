@@ -197,10 +197,13 @@ def _resolve_office_worker_toolsets(authorized_tools: tuple[str, ...]) -> tuple[
     """Require a one-to-one, singleton toolset for every Office capability.
 
     A symbolic Office capability is not permission to select a profile's
-    broader toolset.  Hermes currently has no `read_course_queue` singleton,
-    so the live canary deliberately fails closed until such a toolset exists.
+    broader toolset. Profile plugins must be discovered before resolving the
+    boundary because Kanban CLI commands do not otherwise import model tools.
     """
+    from hermes_cli.plugins import discover_plugins
     from toolsets import resolve_toolset, validate_toolset
+
+    discover_plugins()
 
     for tool in authorized_tools:
         if not validate_toolset(tool) or tuple(resolve_toolset(tool)) != (tool,):

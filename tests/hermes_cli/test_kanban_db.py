@@ -139,6 +139,33 @@ def test_office_dispatch_creates_and_claims_only_its_correlated_task(kanban_home
             kb.dispatch_office_task(conn, metadata={**metadata, "charter_digest": "a" * 64}, profile="course-mapping", title="wrong", body="{}", workspace="/Users/macboat/vercel-openseason", authorized_tools=["read_course_queue"], spawn_fn=spawn)
 
 
+def test_office_tool_surface_discovers_an_enabled_profile_plugin(kanban_home):
+    plugin = kanban_home / "plugins" / "read-course-queue"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        "name: read-course-queue\nversion: '1.0.0'\nprovides_tools:\n  - read_course_queue\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "def register(ctx):\n"
+        "    ctx.register_tool(name='read_course_queue', toolset='read_course_queue', "
+        "schema={'name':'read_course_queue','description':'Read queue.',"
+        "'parameters':{'type':'object','properties':{}}}, handler=lambda args, **kw: '{}')\n",
+        encoding="utf-8",
+    )
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - read-course-queue\n  disabled: []\n",
+        encoding="utf-8",
+    )
+
+    from tools.registry import registry
+
+    try:
+        assert kb._resolve_office_worker_toolsets(("read_course_queue",)) == ("read_course_queue",)
+    finally:
+        registry.deregister("read_course_queue")
+
+
 def test_office_dispatch_fails_closed_without_an_exact_worker_tool_surface(kanban_home):
     metadata = {
         "office_goal_id": "goal-1",
