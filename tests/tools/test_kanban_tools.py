@@ -319,7 +319,7 @@ def test_complete_stamps_the_office_envelope_for_a_correlated_worker(monkeypatch
         "office_assignment_id": "assignment-1",
         "office_attempt_id": "assignment-1:attempt:1",
         "employee_id": "course-mapping",
-        "charter_digest": "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad",
+        "charter_digest": "968d7b54b70345ddf71a3e3f958a70ea16bfadc9eacd9055257492f25fcdd221",
         "evidence_schema_version": "office-evidence-v1",
     }
     with kb.connect() as conn:

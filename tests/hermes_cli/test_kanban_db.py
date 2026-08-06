@@ -20,7 +20,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
-OFFICE_CHARTER_DIGEST = "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad"
+OFFICE_CHARTER_DIGEST = "968d7b54b70345ddf71a3e3f958a70ea16bfadc9eacd9055257492f25fcdd221"
 
 
 def test_office_metadata_requires_exact_correlated_envelope():

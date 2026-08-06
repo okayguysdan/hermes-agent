@@ -138,7 +138,7 @@ _OFFICE_DIGEST_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 _OFFICE_EMPLOYEE_CHARTERS = {
     "course-mapping": {
         "charters": {
-            "652ccee82b2b23a39212e1930a310e41d87bd157aae295aee1ecf13c28680cad": {
+            "968d7b54b70345ddf71a3e3f958a70ea16bfadc9eacd9055257492f25fcdd221": {
                 "workspaces": frozenset({"/Users/macboat/vercel-openseason"}),
                 "tools": frozenset({"read_course_queue"}),
             },
