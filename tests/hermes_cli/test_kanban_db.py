@@ -3515,6 +3515,7 @@ class TestSharedBoardPaths:
             office_toolsets=("read_course_queue",),
         )
         toolsets_index = captured["cmd"].index("--toolsets")
+        assert captured["cmd"].index("chat") < toolsets_index
         assert captured["cmd"][toolsets_index + 1] == "read_course_queue"
         assert "terminal,web" not in captured["cmd"]
 
